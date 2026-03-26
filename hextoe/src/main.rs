@@ -30,14 +30,14 @@ fn main() -> eframe::Result<()> {
 
 struct App {
     game: GameState,
-    /// Current best suggestions from background MCTS: (pos, win_rate in [0,1])
-    suggestions: Vec<(Pos, f32)>,
+    /// Current best suggestions: (pos, win_rate, visits, policy_share).
+    suggestions: Vec<(Pos, f32, u32, f32)>,
     /// Total MCTS iterations accumulated since the last move.
     mcts_iters: u32,
     /// Signal the background thread to stop.
     cancel: Arc<AtomicBool>,
     /// Background thread sends (suggestions, total_iters) as it accumulates.
-    result_rx: Option<Receiver<(Vec<(Pos, f32)>, u32)>>,
+    result_rx: Option<Receiver<(Vec<(Pos, f32, u32, f32)>, u32)>>,
     last_pos: Option<Pos>,
     pan_offset: egui::Vec2,
 }
@@ -289,7 +289,7 @@ impl eframe::App for App {
                         fmt_iters(self.mcts_iters)
                     ));
                     ui.add_space(2.0);
-                    for (rank, (pos, wr)) in self.suggestions.iter().enumerate() {
+                    for (rank, (pos, wr, visits, pol)) in self.suggestions.iter().enumerate() {
                         let marker = ["①", "②", "③"][rank];
                         let col = match rank {
                             0 => Color32::from_rgb(45, 185, 45),
@@ -298,7 +298,14 @@ impl eframe::App for App {
                         };
                         ui.colored_label(
                             col,
-                            format!("{marker} ({},{})  {:.0}%", pos.0, pos.1, wr * 100.0),
+                            format!(
+                                "{marker} ({},{})  {:.0}%  ·  {} visits  ·  {:.1}% policy",
+                                pos.0,
+                                pos.1,
+                                wr * 100.0,
+                                fmt_iters(*visits),
+                                pol * 100.0
+                            ),
                         );
                     }
                 }
@@ -348,11 +355,11 @@ impl eframe::App for App {
                     Default::default()
                 };
 
-            let suggestion_map: std::collections::HashMap<Pos, (usize, f32)> = self
+            let suggestion_map: std::collections::HashMap<Pos, (usize, f32, u32, f32)> = self
                 .suggestions
                 .iter()
                 .enumerate()
-                .map(|(i, &(p, wr))| (p, (i, wr)))
+                .map(|(i, &(p, wr, v, pol))| (p, (i, wr, v, pol)))
                 .collect();
 
             // Cells to render.
@@ -368,7 +375,7 @@ impl eframe::App for App {
             for &p in &self.game.candidates {
                 cells.insert(p);
             }
-            for &(p, _) in &self.suggestions {
+            for &(p, _, _, _) in &self.suggestions {
                 cells.insert(p);
             }
 
@@ -389,7 +396,7 @@ impl eframe::App for App {
                     continue;
                 }
 
-                let sug_rank = suggestion_map.get(pos).map(|&(r, _)| r);
+                let sug_rank = suggestion_map.get(pos).map(|&(r, _, _, _)| r);
                 let corners: Vec<Pos2> = hex_corners(centre, HEX_SIZE - 1.5).into();
                 let fill = cell_fill(*pos, &self.game, &win_cells, sug_rank, hovered);
                 let stroke_col = if win_cells.contains(pos) {
@@ -413,13 +420,18 @@ impl eframe::App for App {
                         FontId::proportional(HEX_SIZE * 0.65),
                         Color32::WHITE,
                     );
-                } else if let Some(&(rank, wr)) = suggestion_map.get(pos) {
+                } else if let Some(&(rank, wr, visits, pol)) = suggestion_map.get(pos) {
                     let marker = ["①", "②", "③"][rank];
                     painter.text(
                         centre,
                         egui::Align2::CENTER_CENTER,
-                        format!("{marker}\n{:.0}%", wr * 100.0),
-                        FontId::proportional(HEX_SIZE * 0.36),
+                        format!(
+                            "{marker}\n{:.0}%\n{} · {:.0}%",
+                            wr * 100.0,
+                            fmt_iters(visits),
+                            pol * 100.0
+                        ),
+                        FontId::proportional(HEX_SIZE * 0.32),
                         Color32::BLACK,
                     );
                 }

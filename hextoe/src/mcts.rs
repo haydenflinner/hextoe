@@ -58,9 +58,12 @@ impl Mcts {
     }
 
     /// Return the top-`top_n` root children sorted by descending win-rate.
-    pub fn best_moves(&self, top_n: usize) -> Vec<(Pos, f32)> {
+    /// Each entry is `(pos, win_rate, visits, policy_share)` where `policy_share`
+    /// is `visits / root_visits` (fraction of simulations that took that edge from root).
+    pub fn best_moves(&self, top_n: usize) -> Vec<(Pos, f32, u32, f32)> {
+        let root_visits = self.nodes[0].visits;
         let root_children = self.nodes[0].children.clone();
-        let mut results: Vec<(Pos, f32)> = root_children
+        let mut results: Vec<(Pos, f32, u32, f32)> = root_children
             .iter()
             .filter_map(|&cid| {
                 let n = &self.nodes[cid];
@@ -70,7 +73,12 @@ impl Mcts {
                 } else {
                     0.5
                 };
-                Some((pos, win_rate))
+                let policy_share = if root_visits > 0 {
+                    n.visits as f32 / root_visits as f32
+                } else {
+                    0.0
+                };
+                Some((pos, win_rate, n.visits, policy_share))
             })
             .collect();
         results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -97,7 +105,8 @@ impl Mcts {
 
     /// Run `iterations` MCTS iterations and return all root children sorted by
     /// descending estimated win-rate (in [0,1]) from root_player's perspective.
-    pub fn search(&mut self, iterations: u32, rng: &mut impl Rng) -> Vec<(Pos, f32)> {
+    /// Tuple is `(pos, win_rate, visits, policy_share)`; see [`Self::best_moves`].
+    pub fn search(&mut self, iterations: u32, rng: &mut impl Rng) -> Vec<(Pos, f32, u32, f32)> {
         for _ in 0..iterations {
             let leaf = self.select(0);
             let child = self.expand(leaf, rng);
@@ -105,22 +114,7 @@ impl Mcts {
             self.backprop(child, reward);
         }
 
-        let root_children = self.nodes[0].children.clone();
-        let mut results: Vec<(Pos, f32)> = root_children
-            .iter()
-            .filter_map(|&cid| {
-                let n = &self.nodes[cid];
-                let pos = n.action?;
-                let win_rate = if n.visits > 0 {
-                    (n.total_value / n.visits as f32 + 1.0) / 2.0
-                } else {
-                    0.5
-                };
-                Some((pos, win_rate))
-            })
-            .collect();
-        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        results
+        self.best_moves(usize::MAX)
     }
 
     // ── Private helpers ──────────────────────────────────────────────────────
