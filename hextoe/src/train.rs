@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use rand::SeedableRng;
 use rayon::prelude::*;
 
+use crate::device::default_inference_device;
 use crate::encode::{CHANNELS, GRID};
 use crate::game::Player;
 use crate::mcts::{RandomRollout, RolloutPolicy};
@@ -94,7 +95,7 @@ impl TrainingConfig {
             lr: DEFAULT_LR,
             weight_decay: DEFAULT_WEIGHT_DECAY,
             self_play_progress_every_n_moves: DEFAULT_SELF_PLAY_PROGRESS_EVERY_N_MOVES,
-            device: Device::Cpu,
+            device: default_inference_device(),
             use_random_rollout,
             self_play_parallel_games: DEFAULT_SELF_PLAY_PARALLEL_GAMES,
         }
@@ -530,7 +531,8 @@ pub fn run_training(
         &monitor,
         log_stdout,
         &format!(
-            "Training loop (~{:.0}s self-play / iter, {} parallel games, {} MCTS iters/move, {rollout_note}). latest={} best={}",
+            "Training loop ({:?}; ~{:.0}s self-play / iter, {} parallel games, {} MCTS iters/move, {rollout_note}). latest={} best={}",
+            config.device,
             config.self_play_secs,
             parallel_game_count(&config),
             config.mcts_iters_per_move,

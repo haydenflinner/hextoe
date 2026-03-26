@@ -10,6 +10,7 @@ use hextoe::encode::{CHANNELS, GRID};
 use hextoe::mcts::RandomRollout;
 use hextoe::nn::HextoeNet;
 use hextoe::self_play::{GameRecord, ReplayBuffer, SelfPlayCollector};
+use hextoe::device::default_inference_device;
 use hextoe::train::{self_play_until_duration, train_step, TrainingConfig};
 use rand::SeedableRng;
 use rand::Rng;
@@ -83,7 +84,7 @@ fn bench_self_play_wall_clock_parallel(c: &mut Criterion) {
 }
 
 fn bench_train_step(c: &mut Criterion) {
-    let device = Device::Cpu;
+    let device = default_inference_device();
     let varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, candle_core::DType::F32, &device);
     let model = HextoeNet::new(vb).expect("model");

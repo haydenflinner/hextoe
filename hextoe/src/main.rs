@@ -1,4 +1,4 @@
-use candle_core::Device;
+use hextoe::device::default_inference_device;
 use hextoe::game::{winning_line, GameState, Player, Pos};
 use hextoe::mcts::{Mcts, RandomRollout};
 use hextoe::nn::{LoadedNet, NeuralRollout};
@@ -82,7 +82,7 @@ impl App {
         let game = self.game.clone();
 
         thread::spawn(move || {
-            let device = Device::Cpu;
+            let device = default_inference_device();
             let loaded_nn = default_inference_checkpoint_path()
                 .and_then(|p| LoadedNet::try_load(p, &device).ok());
             let mut rng = rand::thread_rng();
