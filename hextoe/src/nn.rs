@@ -170,7 +170,7 @@ pub fn neural_rollout_policy(
     let mut ply = 0u32;
     while !state.is_terminal() {
         if ply >= MAX_GAME_MOVES {
-            return 0.0;
+            return state.board_heuristic(root_player);
         }
         let actions = state.legal_actions();
         if actions.is_empty() {
@@ -198,7 +198,7 @@ pub fn neural_rollout_policy(
     match state.winner {
         Some(p) if p == root_player => 1.0,
         Some(_) => -1.0,
-        None => 0.0,
+        None => state.board_heuristic(root_player),
     }
 }
 

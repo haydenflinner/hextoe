@@ -1,8 +1,8 @@
 //! hextoe-train — self-play reinforcement learning loop (AlphaZero style).
 //!
-//! Usage:  cargo run --release --bin hextoe-train [--random-rollout] [--one-checkpoint]
+//! Usage:  cargo run --release --bin hextoe-train [OPTIONS]
 //!
-//! For a live dashboard:  cargo run --release --bin hextoe-train-gui [--random-rollout]
+//! For a live dashboard:  cargo run --release --bin hextoe-train-gui [OPTIONS]
 //!
 //! Hyperparameters: edit `DEFAULT_*` in `hextoe::train` (`src/train.rs`).
 
@@ -14,6 +14,7 @@ fn main() {
             "hextoe-train\n\n\
              Options:\n\
                --random-rollout, -r   MCTS simulations use fast random playouts instead of NN leaf value\n\
+               --population N, -p N   Population tournament mode with N candidates (default 1 = classic)\n\
                --one-checkpoint       Exit after writing latest checkpoint once (e.g. for cargo flamegraph)\n\
                -h, --help             Show this help\n"
         );

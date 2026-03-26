@@ -1,6 +1,6 @@
 //! hextoe-train-gui — same training loop as `hextoe-train` with an eframe metrics window.
 //!
-//! Usage:  cargo run --release --bin hextoe-train-gui [--random-rollout]
+//! Usage:  cargo run --release --bin hextoe-train-gui [OPTIONS]
 //!
 //! Hyperparameters: edit `DEFAULT_*` in `hextoe::train` (`src/train.rs`).
 
@@ -16,6 +16,7 @@ fn main() -> eframe::Result<()> {
             "hextoe-train-gui\n\n\
              Options:\n\
                --random-rollout, -r   MCTS simulations use fast random playouts instead of NN leaf value\n\
+               --population N, -p N   Population tournament mode with N candidates (default 1 = classic)\n\
                -h, --help             Show this help\n"
         );
         return Ok(());

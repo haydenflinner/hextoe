@@ -79,7 +79,7 @@ impl RolloutPolicy for RandomRollout {
         let mut o_hist = LastTwoMoves::default();
         while !state.is_terminal() {
             if ply >= MAX_GAME_MOVES {
-                return 0.0;
+                return state.board_heuristic(root_player);
             }
             let actions = state.legal_actions();
             if actions.is_empty() {
@@ -97,7 +97,7 @@ impl RolloutPolicy for RandomRollout {
         match state.winner {
             Some(p) if p == root_player => 1.0,
             Some(_) => -1.0,
-            None => 0.0,
+            None => state.board_heuristic(root_player),
         }
     }
 

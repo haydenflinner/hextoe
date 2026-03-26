@@ -147,6 +147,47 @@ pub fn check_win(board: &HashMap<Pos, Player>, pos: Pos, player: Player) -> bool
         .any(|&(dq, dr)| count_axis(board, pos, player, dq, dr) >= 6)
 }
 
+/// Exponentially-weighted threat score for one player: sum of `3^(k-1)` for each maximal
+/// consecutive segment of length `k` across all three axes. A 5-in-a-row (81) heavily
+/// outweighs scattered singles (1 each), matching the intuition that connected stones
+/// are far more valuable than lonely ones.
+fn threat_score(board: &HashMap<Pos, Player>, player: Player) -> f64 {
+    let mut total = 0.0f64;
+    for &(dq, dr) in &WIN_AXES {
+        for &pos in board.keys() {
+            if board.get(&pos) != Some(&player) {
+                continue;
+            }
+            // Only process segments starting at this cell (predecessor is not ours).
+            let prev = (pos.0 - dq, pos.1 - dr);
+            if board.get(&prev) == Some(&player) {
+                continue;
+            }
+            let mut len = 1u32;
+            let (mut q, mut r) = (pos.0 + dq, pos.1 + dr);
+            while board.get(&(q, r)) == Some(&player) {
+                len += 1;
+                q += dq;
+                r += dr;
+            }
+            total += 3.0f64.powi(len as i32 - 1);
+        }
+    }
+    total
+}
+
+impl GameState {
+    /// Heuristic evaluation for a non-terminal position. Returns a value in `[-1, 1]` from
+    /// `player`'s perspective, based on relative threat scores (how close each side is to
+    /// building 6-in-a-row). Uses `tanh` so the signal is smooth and bounded.
+    pub fn board_heuristic(&self, player: Player) -> f32 {
+        let my = threat_score(&self.board, player);
+        let opp = threat_score(&self.board, player.other());
+        // Scale so a single 5-in-a-row advantage (~81 pts) maps to ~0.67.
+        ((my - opp) / 100.0).tanh() as f32
+    }
+}
+
 /// Return positions in the winning line through `pos` (used for highlight in GUI).
 pub fn winning_line(board: &HashMap<Pos, Player>, pos: Pos, player: Player) -> Vec<Pos> {
     for &(dq, dr) in &WIN_AXES {

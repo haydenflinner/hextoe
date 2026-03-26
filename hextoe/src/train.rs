@@ -10,14 +10,14 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use rand::SeedableRng;
+use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 
 use crate::device::default_inference_device;
 use crate::encode::{CHANNELS, GRID};
 use crate::game::Player;
 use crate::mcts::{RandomRollout, RolloutPolicy};
-use crate::nn::{load_weights, save_weights, HextoeNet, LoadedNet, NeuralRollout};
+use crate::nn::{build_model, load_weights, save_weights, HextoeNet, LoadedNet, NeuralRollout};
 use crate::self_play::{GameRecord, ReplayBuffer, SelfPlayCollector};
 
 const LOG_CAP: usize = 400;
@@ -33,19 +33,27 @@ pub const DEFAULT_LEGACY_MODEL_PATH: &str = "hextoe_model.safetensors";
 pub const DEFAULT_REPLAY_CAPACITY: usize = 50_000;
 pub const DEFAULT_MIN_BUFFER_FOR_TRAINING: usize = 500;
 /// Wall-clock budget for self-play before each training step.
-pub const DEFAULT_SELF_PLAY_SECS: f64 = 30.0;
-/// Wall-clock budget for new-vs-best games after training (NN mode only).
-pub const DEFAULT_PROMOTION_EVAL_SECS: f64 = 15.0;
+pub const DEFAULT_SELF_PLAY_SECS: f64 = 60.0;
+/// Wall-clock budget for new-vs-best games after training.
+pub const DEFAULT_PROMOTION_EVAL_SECS: f64 = 120.0;
 /// Promote `latest` → `best` if new wins at least this fraction of eval games (no draws counted in denominator).
 pub const DEFAULT_PROMOTION_MIN_WIN_RATE: f64 = 0.52;
-pub const DEFAULT_MCTS_ITERS_PER_MOVE: u32 = 200;
-pub const DEFAULT_TRAIN_STEPS: usize = 5;
+pub const DEFAULT_MCTS_ITERS_PER_MOVE: u32 = 100;
+pub const DEFAULT_TRAIN_STEPS: usize = 10;
 pub const DEFAULT_BATCH_SIZE: usize = 128;
 pub const DEFAULT_LR: f64 = 3e-4;
 pub const DEFAULT_WEIGHT_DECAY: f64 = 1e-4;
 pub const DEFAULT_SELF_PLAY_PROGRESS_EVERY_N_MOVES: u32 = 1;
 /// Concurrent self-play games per batch (`0` = use [`rayon::current_num_threads`]).
 pub const DEFAULT_SELF_PLAY_PARALLEL_GAMES: usize = 0;
+/// Minimum number of NN-vs-NN games in the promotion gate (keeps playing past the time budget
+/// until this many games have been played).
+pub const DEFAULT_MIN_PROMOTION_GAMES: u32 = 20;
+/// After this many consecutive promotion failures, unconditionally promote to avoid stagnation.
+/// `0` disables forced promotion.
+pub const DEFAULT_MAX_STAGNATION_ROUNDS: u32 = 5;
+/// Population size for tournament-based training (`1` = classic single-model loop).
+pub const DEFAULT_POPULATION_SIZE: usize = 1;
 
 /// Hyperparameters for the training loop.
 #[derive(Clone, Debug)]
@@ -73,6 +81,13 @@ pub struct TrainingConfig {
     /// With NN leaf evaluation on a GPU, [`parallel_game_count`] is effectively capped at `1` so
     /// only one thread uses the device at a time (Candle/Metal is not safe for concurrent inference).
     pub self_play_parallel_games: usize,
+    /// Minimum number of NN-vs-NN games for promotion (plays past time budget if needed).
+    pub min_promotion_games: u32,
+    /// After this many consecutive promotion failures, force-promote to escape stagnation.
+    /// `0` disables forced promotion.
+    pub max_stagnation_rounds: u32,
+    /// Number of candidate models per iteration (`1` = classic loop; `>1` = population tournament).
+    pub population_size: usize,
 }
 
 impl Default for TrainingConfig {
@@ -101,12 +116,18 @@ impl TrainingConfig {
             device: default_inference_device(),
             use_random_rollout,
             self_play_parallel_games: DEFAULT_SELF_PLAY_PARALLEL_GAMES,
+            min_promotion_games: DEFAULT_MIN_PROMOTION_GAMES,
+            max_stagnation_rounds: DEFAULT_MAX_STAGNATION_ROUNDS,
+            population_size: DEFAULT_POPULATION_SIZE,
         }
     }
 
-    /// Same as [`TrainingConfig::default`], but sets `use_random_rollout` from `--random-rollout` / `-r`.
+    /// Same as [`TrainingConfig::default`], but applies CLI overrides (`--random-rollout`,
+    /// `--population N`).
     pub fn default_with_cli_rollout() -> Self {
-        Self::from_defaults(cli_use_random_rollout())
+        let mut cfg = Self::from_defaults(cli_use_random_rollout());
+        cfg.population_size = cli_population_size();
+        cfg
     }
 }
 
@@ -118,6 +139,19 @@ pub fn cli_use_random_rollout() -> bool {
 /// True if argv contains `--one-checkpoint` (for `hextoe-train` profiling runs).
 pub fn cli_one_checkpoint() -> bool {
     std::env::args().skip(1).any(|a| a == "--one-checkpoint")
+}
+
+/// Parse `--population N` / `-p N` from argv (`1` if absent).
+pub fn cli_population_size() -> usize {
+    let args: Vec<String> = std::env::args().collect();
+    for (i, a) in args.iter().enumerate() {
+        if (a == "--population" || a == "-p") && i + 1 < args.len() {
+            if let Ok(n) = args[i + 1].parse::<usize>() {
+                return n.max(1);
+            }
+        }
+    }
+    DEFAULT_POPULATION_SIZE
 }
 
 /// Effective number of concurrent self-play games (`0` in config → Rayon thread count).
@@ -425,7 +459,8 @@ pub fn default_inference_checkpoint_path() -> Option<&'static str> {
     )
 }
 
-/// Run new-vs-best games for `promotion_eval_secs`. Returns `(new_wins, games_played)`.
+/// Run new-vs-best games until at least `min_promotion_games` have been played and
+/// `promotion_eval_secs` have elapsed. Returns `(new_wins, games_played)`.
 fn promotion_eval_games(
     collector: &SelfPlayCollector,
     config: &TrainingConfig,
@@ -438,11 +473,12 @@ fn promotion_eval_games(
     cancel: &Option<Arc<AtomicBool>>,
 ) -> (u32, u32) {
     let budget = Duration::from_secs_f64(config.promotion_eval_secs.max(0.0));
+    let min_games = config.min_promotion_games;
     let t0 = Instant::now();
     let mut new_wins = 0u32;
     let mut games = 0u32;
 
-    while t0.elapsed() < budget {
+    while t0.elapsed() < budget || games < min_games {
         if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
             break;
         }
@@ -480,6 +516,258 @@ fn promotion_eval_games(
     (new_wins, games)
 }
 
+/// Play a fixed number of NN-vs-NN games between two networks. Returns `(a_wins, b_wins)`.
+fn head_to_head(
+    collector: &SelfPlayCollector,
+    mcts_iters: u32,
+    rng: &mut rand::rngs::StdRng,
+    net_a: &HextoeNet,
+    net_b: &HextoeNet,
+    device: &Device,
+    games: u32,
+) -> (u32, u32) {
+    let mut a_wins = 0u32;
+    let mut b_wins = 0u32;
+    for g in 0..games {
+        let a_player = if g % 2 == 0 { Player::X } else { Player::O };
+        let winner = collector.play_match_game(mcts_iters, rng, net_a, net_b, a_player, device);
+        match winner {
+            Some(p) if p == a_player => a_wins += 1,
+            Some(_) => b_wins += 1,
+            None => {}
+        }
+    }
+    (a_wins, b_wins)
+}
+
+/// Round-robin tournament among `nets`. Returns win counts for each participant.
+fn round_robin_tournament(
+    collector: &SelfPlayCollector,
+    mcts_iters: u32,
+    rng: &mut rand::rngs::StdRng,
+    nets: &[&HextoeNet],
+    device: &Device,
+    games_per_pair: u32,
+    monitor: &Option<Arc<Mutex<TrainingMonitor>>>,
+    log_stdout: bool,
+) -> Vec<u32> {
+    let n = nets.len();
+    let mut wins = vec![0u32; n];
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let (wi, wj) = head_to_head(
+                collector,
+                mcts_iters,
+                rng,
+                nets[i],
+                nets[j],
+                device,
+                games_per_pair,
+            );
+            wins[i] += wi;
+            wins[j] += wj;
+            log_line(
+                monitor,
+                log_stdout,
+                &format!("    candidate {i} vs {j}: {wi}-{wj}"),
+            );
+        }
+    }
+    wins
+}
+
+/// Population-based training loop. Each iteration trains N candidate models with randomized
+/// hyperparameters, then runs a round-robin tournament (including the incumbent best) and
+/// keeps the winner.
+fn run_population_training(
+    config: TrainingConfig,
+    monitor: Option<Arc<Mutex<TrainingMonitor>>>,
+    log_stdout: bool,
+    cancel: Option<Arc<AtomicBool>>,
+) -> candle_core::Result<()> {
+    let device = config.device.clone();
+    let pop_size = config.population_size.max(2);
+    let games_per_pair: u32 = 6;
+    let collector = SelfPlayCollector::new();
+    let mut rng = rand::rngs::StdRng::from_entropy();
+    let mut buffer = ReplayBuffer::new(config.replay_capacity);
+
+    // Seed the best checkpoint from existing weights if available.
+    if !Path::new(&config.best_path).is_file() {
+        if let Some(src) = resolve_initial_checkpoint_path(
+            &config.latest_path,
+            &config.best_path,
+            DEFAULT_LEGACY_MODEL_PATH,
+        ) {
+            fs::copy(src, &config.best_path).map_err(io_to_candle)?;
+            log_line(
+                &monitor,
+                log_stdout,
+                &format!("population: seeded best from {src}"),
+            );
+        } else {
+            let (vm, _) = build_model(&device)?;
+            save_weights(&vm, &config.best_path)?;
+            log_line(
+                &monitor,
+                log_stdout,
+                "population: no checkpoint found — initialised random best",
+            );
+        }
+    }
+
+    log_line(
+        &monitor,
+        log_stdout,
+        &format!(
+            "Population training: {} candidates + incumbent, {:.0}s self-play, {} MCTS iters/move, {} games/pair",
+            pop_size, config.self_play_secs, config.mcts_iters_per_move, games_per_pair
+        ),
+    );
+
+    let mut iteration = 0u32;
+    loop {
+        if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
+            log_line(&monitor, log_stdout, "Population training stopped by user.");
+            break;
+        }
+
+        iteration += 1;
+        log_line(&monitor, log_stdout, &format!("[pop iter {iteration}] starting…"));
+
+        if let Some(m) = &monitor {
+            if let Ok(mut g) = m.lock() {
+                g.iteration = iteration;
+                g.phase = TrainPhase::SelfPlay;
+                g.buffer_len = buffer.len();
+            }
+        }
+
+        // ── Self-play with random rollout ──
+        let rollout = RandomRollout;
+        let (new_records, game_secs, games_played) = self_play_until_duration(
+            &collector,
+            &config,
+            &mut rng,
+            &rollout,
+            &monitor,
+            log_stdout,
+            &cancel,
+            &mut buffer,
+        );
+
+        let sp_total: f64 = game_secs.iter().sum();
+        log_line(
+            &monitor,
+            log_stdout,
+            &format!(
+                "[pop iter {iteration}] +{new_records} records  buffer {}/{}  |  {games_played} games in {sp_total:.1}s",
+                buffer.len(),
+                config.replay_capacity,
+            ),
+        );
+
+        if buffer.len() < config.min_buffer_for_training {
+            log_line(&monitor, log_stdout, "  (buffer too small, skipping training)");
+            continue;
+        }
+
+        if let Some(m) = &monitor {
+            if let Ok(mut g) = m.lock() {
+                g.phase = TrainPhase::Training;
+            }
+        }
+
+        // ── Train N candidates from the current best with randomized hyperparameters ──
+        let mut candidates: Vec<(VarMap, HextoeNet, String)> = Vec::with_capacity(pop_size);
+        for i in 0..pop_size {
+            let (mut vm, net) = build_model(&device)?;
+            load_weights(&mut vm, &config.best_path)?;
+
+            let lr_factor: f64 = 10f64.powf(rng.gen_range(-0.5..0.5));
+            let lr = config.lr * lr_factor;
+            let steps_factor: f64 = rng.gen_range(0.5..2.0);
+            let steps = ((config.train_steps as f64) * steps_factor).round().max(1.0) as usize;
+            let wd_factor: f64 = 10f64.powf(rng.gen_range(-0.5..0.5));
+            let wd = config.weight_decay * wd_factor;
+
+            let adam_params = ParamsAdamW {
+                lr,
+                weight_decay: wd,
+                ..Default::default()
+            };
+            let mut opt = AdamW::new(vm.all_vars(), adam_params)?;
+
+            let mut total_loss = 0.0f32;
+            for _ in 0..steps {
+                let batch = buffer.sample_batch(config.batch_size, &mut rng);
+                let loss = train_step(&net, &batch, &device, &mut opt)?;
+                total_loss += loss;
+            }
+            let mean_loss = total_loss / steps as f32;
+            let desc = format!(
+                "cand {i}: lr={lr:.2e} wd={wd:.2e} steps={steps} loss={mean_loss:.4}"
+            );
+            log_line(&monitor, log_stdout, &format!("  {desc}"));
+            candidates.push((vm, net, desc));
+        }
+
+        // ── Load incumbent (current best, untrained) ──
+        let incumbent = LoadedNet::try_load(&config.best_path, &device)?;
+
+        if let Some(m) = &monitor {
+            if let Ok(mut g) = m.lock() {
+                g.phase = TrainPhase::PromotionEval;
+            }
+        }
+
+        // ── Round-robin tournament: candidates + incumbent ──
+        let mut all_nets: Vec<&HextoeNet> = candidates.iter().map(|(_, n, _)| n).collect();
+        all_nets.push(&incumbent.net);
+        let incumbent_idx = all_nets.len() - 1;
+
+        log_line(&monitor, log_stdout, "  round-robin tournament…");
+        let wins = round_robin_tournament(
+            &collector,
+            config.mcts_iters_per_move,
+            &mut rng,
+            &all_nets,
+            &device,
+            games_per_pair,
+            &monitor,
+            log_stdout,
+        );
+
+        let (best_idx, best_wins) = wins
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, w)| *w)
+            .unwrap();
+
+        let msg = if best_idx == incumbent_idx {
+            format!(
+                "population: incumbent wins ({best_wins} wins) — best unchanged"
+            )
+        } else {
+            save_weights(&candidates[best_idx].0, &config.best_path)?;
+            save_weights(&candidates[best_idx].0, &config.latest_path)?;
+            format!(
+                "population: {} wins ({best_wins} wins) → updated best",
+                candidates[best_idx].2,
+            )
+        };
+        log_line(&monitor, log_stdout, &format!("  {msg}"));
+        if let Some(m) = &monitor {
+            if let Ok(mut g) = m.lock() {
+                g.last_promotion_msg = Some(msg);
+                g.phase = TrainPhase::Idle;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn io_to_candle(e: std::io::Error) -> candle_core::Error {
     candle_core::Error::Msg(format!("{e}"))
 }
@@ -488,6 +776,9 @@ fn io_to_candle(e: std::io::Error) -> candle_core::Error {
 ///
 /// If `stop_after_first_checkpoint` is true, exits right after the first successful write to
 /// [`TrainingConfig::latest_path`] (skips promotion eval). Useful with `cargo flamegraph`.
+///
+/// When [`TrainingConfig::population_size`] > 1, delegates to a population-based tournament
+/// loop instead of the classic single-model AlphaZero loop.
 pub fn run_training(
     config: TrainingConfig,
     monitor: Option<Arc<Mutex<TrainingMonitor>>>,
@@ -495,6 +786,10 @@ pub fn run_training(
     cancel: Option<Arc<AtomicBool>>,
     stop_after_first_checkpoint: bool,
 ) -> candle_core::Result<()> {
+    if config.population_size > 1 {
+        return run_population_training(config, monitor, log_stdout, cancel);
+    }
+
     let device = config.device.clone();
 
     let varmap = VarMap::new();
@@ -533,6 +828,7 @@ pub fn run_training(
     let collector = SelfPlayCollector::new();
     let mut rng = rand::rngs::StdRng::from_entropy();
     let mut one_checkpoint_buffer_hinted = false;
+    let mut consecutive_failures = 0u32;
 
     let rollout_note = if config.use_random_rollout {
         "random playouts"
@@ -712,33 +1008,7 @@ pub fn run_training(
             break;
         }
 
-        // Promotion gate: keep `best` unless the new net fails the eval (NN mode only).
-        if config.use_random_rollout {
-            if !Path::new(&config.best_path).is_file() {
-                fs::copy(&config.latest_path, &config.best_path).map_err(io_to_candle)?;
-                let msg = format!(
-                    "promotion: copied latest → best (no prior best; random rollout mode)"
-                );
-                log_line(&monitor, log_stdout, &format!("  {msg}"));
-                if let Some(m) = &monitor {
-                    if let Ok(mut g) = m.lock() {
-                        g.last_promotion_msg = Some(msg);
-                        g.phase = TrainPhase::Idle;
-                    }
-                }
-            } else {
-                let msg = "promotion: skipped (--random-rollout)";
-                log_line(&monitor, log_stdout, &format!("  {msg}"));
-                if let Some(m) = &monitor {
-                    if let Ok(mut g) = m.lock() {
-                        g.last_promotion_msg = Some(msg.to_string());
-                        g.phase = TrainPhase::Idle;
-                    }
-                }
-            }
-            continue;
-        }
-
+        // Promotion gate: NN-vs-NN evaluation regardless of self-play rollout mode.
         if let Some(m) = &monitor {
             if let Ok(mut g) = m.lock() {
                 g.phase = TrainPhase::PromotionEval;
@@ -784,19 +1054,43 @@ pub fn run_training(
         } else {
             0.0
         };
-        let promoted = promo_games > 0 && rate >= config.promotion_min_win_rate;
+        let mut promoted = promo_games > 0 && rate >= config.promotion_min_win_rate;
+
+        let force_threshold = config.max_stagnation_rounds;
+        if !promoted && force_threshold > 0 {
+            consecutive_failures += 1;
+        }
+        let force_promoted = !promoted
+            && force_threshold > 0
+            && consecutive_failures >= force_threshold;
+        if force_promoted {
+            promoted = true;
+        }
+
         let msg = if promo_games == 0 {
             "promotion: no eval games in budget — best unchanged".to_string()
+        } else if force_promoted {
+            fs::copy(&config.latest_path, &config.best_path).map_err(io_to_candle)?;
+            consecutive_failures = 0;
+            format!(
+                "promotion: new wins {new_wins}/{promo_games} ({:.1}%) — FORCE-PROMOTED after {} consecutive failures",
+                rate * 100.0,
+                force_threshold,
+            )
         } else if promoted {
             fs::copy(&config.latest_path, &config.best_path).map_err(io_to_candle)?;
+            consecutive_failures = 0;
             format!(
-                "promotion: new wins {new_wins}/{promo_games} ({rate:.1}%) ≥ {:.0}% → updated best",
-                config.promotion_min_win_rate * 100.0
+                "promotion: new wins {new_wins}/{promo_games} ({:.1}%) ≥ {:.0}% → updated best",
+                rate * 100.0,
+                config.promotion_min_win_rate * 100.0,
             )
         } else {
             format!(
-                "promotion: new wins {new_wins}/{promo_games} ({rate:.1}%) < {:.0}% — best unchanged",
-                config.promotion_min_win_rate * 100.0
+                "promotion: new wins {new_wins}/{promo_games} ({:.1}%) < {:.0}% — best unchanged (stagnation {consecutive_failures}/{})",
+                rate * 100.0,
+                config.promotion_min_win_rate * 100.0,
+                force_threshold,
             )
         };
         log_line(&monitor, log_stdout, &format!("  {msg}"));

@@ -186,6 +186,8 @@ impl SelfPlayCollector {
         }
 
         // ----- assign outcomes -----
+        // Decisive games use +1/-1. Non-terminal games (MAX_GAME_MOVES reached) use a
+        // threat-based heuristic so the value head still gets a useful training signal.
         let winner = state.winner;
         steps
             .into_iter()
@@ -193,7 +195,7 @@ impl SelfPlayCollector {
                 let outcome = match winner {
                     Some(w) if w == player => 1.0,
                     Some(_) => -1.0,
-                    None => 0.0,
+                    None => state.board_heuristic(player),
                 };
                 GameRecord {
                     state_enc: Box::new(state_enc),
@@ -259,7 +261,21 @@ impl SelfPlayCollector {
             move_count += 1;
         }
 
-        state.winner
+        // Decisive winner takes precedence; for non-terminal games, use the board
+        // heuristic so tournaments can still differentiate candidates.
+        match state.winner {
+            w @ Some(_) => w,
+            None => {
+                let h = state.board_heuristic(Player::X);
+                if h > 0.01 {
+                    Some(Player::X)
+                } else if h < -0.01 {
+                    Some(Player::O)
+                } else {
+                    None
+                }
+            }
+        }
     }
 }
 
