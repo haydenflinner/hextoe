@@ -16,6 +16,7 @@ name = "hextoe-train"
 path = "src/bin/train.rs"
 
 [dependencies]
+rayon = "1.10"
 eframe = "0.28"
 egui = "0.28"
 rand = "0.8"

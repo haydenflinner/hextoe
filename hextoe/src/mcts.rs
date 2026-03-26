@@ -8,6 +8,7 @@
 ///   per-level sign bookkeeping that breaks for 2-moves-per-turn games.
 use crate::game::{GameState, Player, Pos};
 use rand::Rng;
+use rayon::prelude::*;
 
 const C: f32 = std::f32::consts::SQRT_2;
 
@@ -48,13 +49,118 @@ impl Mcts {
     }
 
     /// Run `n` MCTS iterations without returning results (used by self-play).
+    ///
+    /// Uses root-parallel MCTS across Rayon’s thread pool when `n` is large
+    /// enough to use multiple workers; otherwise runs serially (same RNG).
+    ///
+    /// Parallel workers each run from an empty tree on a clone of the root
+    /// [`GameState`], then statistics are merged additively into this tree.
     pub fn search_iters(&mut self, n: u32, rng: &mut impl Rng) {
+        let threads = rayon::current_num_threads().max(1);
+        if n == 0 {
+            return;
+        }
+        // Require ~2 iters per Rayon worker so tree-clone cost pays off.
+        if threads == 1 || n < threads as u32 * 2 {
+            self.search_iters_serial(n, rng);
+        } else {
+            self.search_iters_parallel(n);
+        }
+    }
+
+    fn search_iters_serial(&mut self, n: u32, rng: &mut impl Rng) {
         for _ in 0..n {
             let leaf = self.select(0);
             let child = self.expand(leaf, rng);
             let reward = self.simulate(child, rng);
             self.backprop(child, reward);
         }
+    }
+
+    /// Root-parallel batch: each worker runs from an empty tree on a copy of
+    /// the root [`GameState`], then root statistics are merged additively.
+    /// (Workers use [`rand::thread_rng`].)
+    fn search_iters_parallel(&mut self, n: u32) {
+        let threads = rayon::current_num_threads().max(1);
+        let num_workers = (threads as u32).min(n) as usize;
+        let per = n / num_workers as u32;
+        let rem = n % num_workers as u32;
+        let chunks: Vec<u32> = (0..num_workers)
+            .map(|i| per + if (i as u32) < rem { 1 } else { 0 })
+            .filter(|&c| c > 0)
+            .collect();
+
+        let root_state = self.nodes[0].state.clone();
+
+        let workers: Vec<Mcts> = chunks
+            .into_par_iter()
+            .map(|chunk| {
+                let mut m = Mcts::new(root_state.clone());
+                let mut rng = rand::thread_rng();
+                m.search_iters_serial(chunk, &mut rng);
+                m
+            })
+            .collect();
+
+        for w in &workers {
+            self.merge_fresh_worker_tree(w);
+        }
+    }
+
+    /// Merge statistics from a worker tree that started empty at this root
+    /// position (additive visits / total_value at root and root children).
+    fn merge_fresh_worker_tree(&mut self, w: &Mcts) {
+        self.nodes[0].visits += w.nodes[0].visits;
+        self.nodes[0].total_value += w.nodes[0].total_value;
+
+        for &wc in &w.nodes[0].children {
+            let oc = &w.nodes[wc];
+            let Some(pos) = oc.action else {
+                continue;
+            };
+            if let Some(id) = self.find_root_child(pos) {
+                self.nodes[id].visits += oc.visits;
+                self.nodes[id].total_value += oc.total_value;
+            } else {
+                let new_id = self.copy_subtree_from(w, wc);
+                self.nodes[new_id].parent = Some(0);
+                self.nodes[0].children.push(new_id);
+            }
+        }
+    }
+
+    fn find_root_child(&self, pos: Pos) -> Option<usize> {
+        self.nodes[0].children.iter().copied().find(|&cid| {
+            self.nodes[cid].action == Some(pos)
+        })
+    }
+
+    /// Deep-copy `other`’s subtree rooted at `root_id` into `self`’s arena.
+    fn copy_subtree_from(&mut self, other: &Mcts, root_id: usize) -> usize {
+        fn copy_node(this: &mut Mcts, other: &Mcts, oid: usize) -> usize {
+            let node = &other.nodes[oid];
+            let child_ids: Vec<usize> = node
+                .children
+                .iter()
+                .map(|&c| copy_node(this, other, c))
+                .collect();
+            let new_node = Node {
+                state: node.state.clone(),
+                action: node.action,
+                parent: None,
+                children: child_ids.clone(),
+                total_value: node.total_value,
+                visits: node.visits,
+                unexpanded: node.unexpanded.clone(),
+            };
+            let nid = this.nodes.len();
+            this.nodes.push(new_node);
+            for &cid in &child_ids {
+                this.nodes[cid].parent = Some(nid);
+            }
+            nid
+        }
+        copy_node(self, other, root_id)
     }
 
     /// Return the top-`top_n` root children sorted by descending win-rate.
@@ -81,7 +187,7 @@ impl Mcts {
                 Some((pos, win_rate, n.visits, policy_share))
             })
             .collect();
-        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| b.1.total_cmp(&a.1));
         results.truncate(top_n);
         results
     }
@@ -154,11 +260,7 @@ impl Mcts {
             id = *node
                 .children
                 .iter()
-                .max_by(|&&a, &&b| {
-                    self.ucb(a)
-                        .partial_cmp(&self.ucb(b))
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
+                .max_by(|&&a, &&b| self.ucb(a).total_cmp(&self.ucb(b)))
                 .unwrap();
         }
     }
@@ -224,5 +326,33 @@ impl Mcts {
                 None => break,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+
+    #[test]
+    fn search_iters_accumulates_root_visits() {
+        let mut m = Mcts::new(GameState::new());
+        let mut rng = StdRng::seed_from_u64(42);
+        let n = 100u32;
+        let before = m.nodes[0].visits;
+        m.search_iters(n, &mut rng);
+        assert_eq!(m.nodes[0].visits, before + n);
+        assert_eq!(m.total_visits(), before + n);
+    }
+
+    #[test]
+    fn parallel_merge_adds_onto_existing_root_visits() {
+        let mut m = Mcts::new(GameState::new());
+        let mut rng = StdRng::seed_from_u64(7);
+        m.search_iters_serial(20, &mut rng);
+        let before = m.nodes[0].visits;
+        m.search_iters(80, &mut rng);
+        assert_eq!(m.nodes[0].visits, before + 80);
     }
 }
