@@ -138,6 +138,67 @@ impl HextoeNet {
     }
 }
 
+/// Weights + network; keep together for inference (layers reference [`VarMap`] tensors).
+pub struct LoadedNet {
+    varmap: VarMap,
+    pub net: HextoeNet,
+}
+
+impl LoadedNet {
+    /// Build structure and load weights from `path` (e.g. `hextoe_model.safetensors`).
+    pub fn try_load(path: &str, device: &Device) -> Result<Self> {
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, device);
+        let net = HextoeNet::new(vb)?;
+        let mut s = LoadedNet { varmap, net };
+        load_weights(&mut s.varmap, path)?;
+        Ok(s)
+    }
+}
+
+/// Run one MCTS rollout using the network policy until terminal (used by [`NeuralRollout`]).
+pub fn neural_rollout_policy(
+    net: &HextoeNet,
+    device: &Device,
+    mut state: GameState,
+    root_player: Player,
+    rng: &mut impl Rng,
+) -> f32 {
+    let mut ply = 0u32;
+    while !state.is_terminal() {
+        if ply >= MAX_GAME_MOVES {
+            return 0.0;
+        }
+        let actions = state.legal_actions();
+        if actions.is_empty() {
+            break;
+        }
+        let center = board_center(&state);
+        let pos = match net.evaluate_state(&state, device) {
+            Ok((probs, _)) => {
+                let idx = sample_policy_index(&probs, rng);
+                let pos = index_to_action(idx, center);
+                if actions.contains(&pos) {
+                    pos
+                } else {
+                    actions[rng.gen_range(0..actions.len())]
+                }
+            }
+            Err(_) => {
+                let mut fallback = RandomRollout;
+                return fallback.rollout(state, root_player, rng);
+            }
+        };
+        state.place(pos);
+        ply += 1;
+    }
+    match state.winner {
+        Some(p) if p == root_player => 1.0,
+        Some(_) => -1.0,
+        None => 0.0,
+    }
+}
+
 /// Sample a flat action index from a masked policy vector (illegal entries are ~0).
 pub fn sample_policy_index(probs: &[f32], rng: &mut impl Rng) -> usize {
     let sum: f32 = probs.iter().copied().filter(|p| p.is_finite() && *p > 0.0).sum();
@@ -162,40 +223,8 @@ pub struct NeuralRollout<'a> {
 }
 
 impl RolloutPolicy for NeuralRollout<'_> {
-    fn rollout(&mut self, mut state: GameState, root_player: Player, rng: &mut impl Rng) -> f32 {
-        let mut ply = 0u32;
-        while !state.is_terminal() {
-            if ply >= MAX_GAME_MOVES {
-                return 0.0;
-            }
-            let actions = state.legal_actions();
-            if actions.is_empty() {
-                break;
-            }
-            let center = board_center(&state);
-            let pos = match self.net.evaluate_state(&state, self.device) {
-                Ok((probs, _)) => {
-                    let idx = sample_policy_index(&probs, rng);
-                    let pos = index_to_action(idx, center);
-                    if actions.contains(&pos) {
-                        pos
-                    } else {
-                        actions[rng.gen_range(0..actions.len())]
-                    }
-                }
-                Err(_) => {
-                    let mut fallback = RandomRollout;
-                    return fallback.rollout(state, root_player, rng);
-                }
-            };
-            state.place(pos);
-            ply += 1;
-        }
-        match state.winner {
-            Some(p) if p == root_player => 1.0,
-            Some(_) => -1.0,
-            None => 0.0,
-        }
+    fn rollout(&mut self, state: GameState, root_player: Player, rng: &mut impl Rng) -> f32 {
+        neural_rollout_policy(self.net, self.device, state, root_player, rng)
     }
 
     const PARALLEL_SAFE: bool = false;

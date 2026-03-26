@@ -1,5 +1,7 @@
+use candle_core::Device;
 use hextoe::game::{winning_line, GameState, Player, Pos};
 use hextoe::mcts::{Mcts, RandomRollout};
+use hextoe::nn::{LoadedNet, NeuralRollout};
 
 use eframe::egui;
 use egui::{Color32, FontId, Pos2, RichText, Stroke};
@@ -11,6 +13,8 @@ use std::thread;
 const HEX_SIZE: f32 = 32.0;
 /// Iterations per batch sent by the background thread.
 const BATCH_SIZE: u32 = 300;
+/// Same default filename as `hextoe-train` writes (`cargo run --bin hextoe-train` from crate dir).
+const MODEL_PATH: &str = "hextoe_model.safetensors";
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
@@ -30,6 +34,8 @@ fn main() -> eframe::Result<()> {
 
 struct App {
     game: GameState,
+    /// `hextoe_model.safetensors` is present (UI hint; each MCTS thread loads its own copy).
+    nn_checkpoint_hint: bool,
     /// Current best suggestions: (pos, win_rate, visits, policy_share).
     suggestions: Vec<(Pos, f32, u32, f32)>,
     /// Total MCTS iterations accumulated since the last move.
@@ -44,8 +50,10 @@ struct App {
 
 impl App {
     fn new() -> Self {
+        let nn_checkpoint_hint = std::path::Path::new(MODEL_PATH).exists();
         let mut app = App {
             game: GameState::new(),
+            nn_checkpoint_hint,
             suggestions: vec![],
             mcts_iters: 0,
             cancel: Arc::new(AtomicBool::new(false)),
@@ -76,14 +84,27 @@ impl App {
         let game = self.game.clone();
 
         thread::spawn(move || {
+            let device = Device::Cpu;
+            let loaded_nn = LoadedNet::try_load(MODEL_PATH, &device).ok();
             let mut rng = rand::thread_rng();
             let mut mcts = Mcts::new(game);
-            let mut rollout = RandomRollout;
             loop {
                 if cancel.load(Ordering::Relaxed) {
                     break;
                 }
-                mcts.search_iters(BATCH_SIZE, &mut rng, &mut rollout);
+                match &loaded_nn {
+                    Some(ld) => {
+                        let mut r = NeuralRollout {
+                            net: &ld.net,
+                            device: &device,
+                        };
+                        mcts.search_iters(BATCH_SIZE, &mut rng, &mut r);
+                    }
+                    None => {
+                        let mut r = RandomRollout;
+                        mcts.search_iters(BATCH_SIZE, &mut rng, &mut r);
+                    }
+                }
                 let iters = mcts.total_visits();
                 let best = mcts.best_moves(3);
                 if tx.send((best, iters)).is_err() {
@@ -285,6 +306,23 @@ impl eframe::App for App {
                     ui.label("Analysing…");
                     ui.spinner();
                 } else {
+                    if self.nn_checkpoint_hint {
+                        ui.label(
+                            RichText::new("Analysis: trained policy rollouts")
+                                .size(12.0)
+                                .color(Color32::from_rgb(120, 200, 140)),
+                        );
+                        ui.add_space(4.0);
+                    } else {
+                        ui.label(
+                            RichText::new(format!(
+                                "No {MODEL_PATH} — random rollouts"
+                            ))
+                            .size(11.0)
+                            .color(Color32::from_rgb(200, 160, 90)),
+                        );
+                        ui.add_space(4.0);
+                    }
                     ui.label(format!(
                         "Top moves  ({} iters)",
                         fmt_iters(self.mcts_iters)
