@@ -6,7 +6,10 @@
 ///   enumeration never rescans the full board.
 /// - Rewards are stored from a fixed root-player perspective, avoiding
 ///   per-level sign bookkeeping that breaks for 2-moves-per-turn games.
-use crate::game::{GameState, Player, Pos};
+use crate::game::{
+    find_immediate_win_move, find_two_move_win_first, is_first_move_of_pair, GameState, Player,
+    Pos,
+};
 use rand::Rng;
 use rayon::prelude::*;
 
@@ -39,7 +42,15 @@ impl RolloutPolicy for RandomRollout {
             if actions.is_empty() {
                 break;
             }
-            let action = actions[rng.gen_range(0..actions.len())];
+            let action = find_immediate_win_move(&state)
+                .or_else(|| {
+                    if is_first_move_of_pair(&state) {
+                        find_two_move_win_first(&state)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| actions[rng.gen_range(0..actions.len())]);
             state.place(action);
             ply += 1;
         }
@@ -454,7 +465,8 @@ mod tests {
         assert!(!g.is_terminal());
 
         let rollout = RandomRollout;
-        let n = 8_000u32;
+        // Enough for Q → 1 on the forced win; keep moderate so `cargo test` (debug) stays usable.
+        let n = 600u32;
 
         let mut serial = Mcts::new(g.clone());
         let mut rng = StdRng::seed_from_u64(99);
