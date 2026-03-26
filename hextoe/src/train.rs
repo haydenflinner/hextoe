@@ -69,6 +69,9 @@ pub struct TrainingConfig {
     /// If true, MCTS simulations use fast uniform random playouts instead of NN value at the leaf.
     pub use_random_rollout: bool,
     /// How many games to run in parallel during each self-play batch (`0` = Rayon thread count).
+    ///
+    /// With NN leaf evaluation on a GPU, [`parallel_game_count`] is effectively capped at `1` so
+    /// only one thread uses the device at a time (Candle/Metal is not safe for concurrent inference).
     pub self_play_parallel_games: usize,
 }
 
@@ -118,11 +121,19 @@ pub fn cli_one_checkpoint() -> bool {
 }
 
 /// Effective number of concurrent self-play games (`0` in config → Rayon thread count).
+///
+/// NN rollouts on a non-CPU [`Device`] are limited to one concurrent game: multiple Rayon workers
+/// would call into the same Candle GPU context and can abort on Metal (e.g. AGX “command encoder is
+/// already encoding”) or misbehave on other backends.
 pub fn parallel_game_count(config: &TrainingConfig) -> usize {
-    match config.self_play_parallel_games {
+    let n = match config.self_play_parallel_games {
         0 => rayon::current_num_threads().max(1),
         n => n.max(1),
+    };
+    if !config.use_random_rollout && !matches!(config.device, Device::Cpu) {
+        return 1;
     }
+    n
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -217,8 +228,9 @@ fn log_line(
 
 /// Play full games until `self_play_secs` wall time has elapsed (no new batch starts after the budget).
 ///
-/// When [`TrainingConfig::self_play_parallel_games`] resolves to more than one, each batch runs that
-/// many games on Rayon (shared read-only `rollout`; each game uses its own RNG).
+/// When [`parallel_game_count`] is more than one, each batch runs that many games on Rayon (shared
+/// read-only `rollout`; each game uses its own RNG). With NN rollouts on GPU, the effective count is
+/// `1` — see [`parallel_game_count`].
 pub fn self_play_until_duration<P: RolloutPolicy + Send + Sync>(
     collector: &SelfPlayCollector,
     config: &TrainingConfig,

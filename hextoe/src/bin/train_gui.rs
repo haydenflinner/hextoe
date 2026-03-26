@@ -45,10 +45,13 @@ fn main() -> eframe::Result<()> {
         }
     });
 
+    // eframe defaults to Wgpu when both glow+wgpu features are enabled; on macOS that shares Metal
+    // with Candle’s training thread and can abort with AGX “command encoder is already encoding”.
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([920.0, 720.0])
             .with_title("hextoe training"),
+        renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
 
