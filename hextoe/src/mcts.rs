@@ -47,6 +47,54 @@ impl Mcts {
         }
     }
 
+    /// Run `n` MCTS iterations without returning results (used by self-play).
+    pub fn search_iters(&mut self, n: u32, rng: &mut impl Rng) {
+        for _ in 0..n {
+            let leaf = self.select(0);
+            let child = self.expand(leaf, rng);
+            let reward = self.simulate(child, rng);
+            self.backprop(child, reward);
+        }
+    }
+
+    /// Return the top-`top_n` root children sorted by descending win-rate.
+    pub fn best_moves(&self, top_n: usize) -> Vec<(Pos, f32)> {
+        let root_children = self.nodes[0].children.clone();
+        let mut results: Vec<(Pos, f32)> = root_children
+            .iter()
+            .filter_map(|&cid| {
+                let n = &self.nodes[cid];
+                let pos = n.action?;
+                let win_rate = if n.visits > 0 {
+                    (n.total_value / n.visits as f32 + 1.0) / 2.0
+                } else {
+                    0.5
+                };
+                Some((pos, win_rate))
+            })
+            .collect();
+        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        results.truncate(top_n);
+        results
+    }
+
+    /// Total iterations run so far (= root visit count).
+    pub fn total_visits(&self) -> u32 {
+        self.nodes[0].visits
+    }
+
+    /// Return `(action, visit_count)` for every direct child of the root.
+    pub fn root_children_stats(&self) -> Vec<(Pos, u32)> {
+        self.nodes[0]
+            .children
+            .iter()
+            .filter_map(|&cid| {
+                let n = &self.nodes[cid];
+                Some((n.action?, n.visits))
+            })
+            .collect()
+    }
+
     /// Run `iterations` MCTS iterations and return all root children sorted by
     /// descending estimated win-rate (in [0,1]) from root_player's perspective.
     pub fn search(&mut self, iterations: u32, rng: &mut impl Rng) -> Vec<(Pos, f32)> {

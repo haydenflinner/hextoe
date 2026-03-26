@@ -1,20 +1,21 @@
-mod game;
-mod mcts;
+use hextoe::game::{winning_line, GameState, Player, Pos};
+use hextoe::mcts::Mcts;
 
 use eframe::egui;
-use egui::{Color32, FontId, Pos2, Stroke};
-use game::{winning_line, GameState, Player, Pos};
-use mcts::Mcts;
+use egui::{Color32, FontId, Pos2, RichText, Stroke};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
 const HEX_SIZE: f32 = 32.0;
-const MCTS_ITERATIONS: u32 = 4_000;
+/// Iterations per batch sent by the background thread.
+const BATCH_SIZE: u32 = 300;
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1000.0, 720.0])
+            .with_inner_size([1060.0, 740.0])
             .with_title("Hextoe"),
         ..Default::default()
     };
@@ -25,19 +26,20 @@ fn main() -> eframe::Result<()> {
     )
 }
 
-// ── Application state ────────────────────────────────────────────────────────
+// ── Application state ─────────────────────────────────────────────────────────
 
 struct App {
     game: GameState,
-    /// Top-N MCTS suggestions: (position, win_rate in [0,1])
+    /// Current best suggestions from background MCTS: (pos, win_rate in [0,1])
     suggestions: Vec<(Pos, f32)>,
-    computing: bool,
-    result_rx: Option<Receiver<Vec<(Pos, f32)>>>,
-    /// Position of the last placed piece (for win-line detection).
+    /// Total MCTS iterations accumulated since the last move.
+    mcts_iters: u32,
+    /// Signal the background thread to stop.
+    cancel: Arc<AtomicBool>,
+    /// Background thread sends (suggestions, total_iters) as it accumulates.
+    result_rx: Option<Receiver<(Vec<(Pos, f32)>, u32)>>,
     last_pos: Option<Pos>,
-    /// Offset applied to the board view (panning).
     pan_offset: egui::Vec2,
-    drag_start: Option<Pos2>,
 }
 
 impl App {
@@ -45,29 +47,51 @@ impl App {
         let mut app = App {
             game: GameState::new(),
             suggestions: vec![],
-            computing: false,
+            mcts_iters: 0,
+            cancel: Arc::new(AtomicBool::new(false)),
             result_rx: None,
             last_pos: None,
             pan_offset: egui::Vec2::ZERO,
-            drag_start: None,
         };
-        app.start_mcts();
+        app.restart_mcts();
         app
     }
 
-    fn start_mcts(&mut self) {
+    /// Cancel any running background thread and start a new one for the
+    /// current game state.  The thread runs continuously until cancelled,
+    /// improving suggestions with each batch.
+    fn restart_mcts(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        self.mcts_iters = 0;
+        self.result_rx = None;
+
         if self.game.is_terminal() {
             return;
         }
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.cancel = Arc::clone(&cancel);
+
         let (tx, rx) = mpsc::channel();
-        let game_clone = self.game.clone();
+        let game = self.game.clone();
+
         thread::spawn(move || {
             let mut rng = rand::thread_rng();
-            let mut mcts = Mcts::new(game_clone);
-            let _ = tx.send(mcts.search(MCTS_ITERATIONS, &mut rng));
+            let mut mcts = Mcts::new(game);
+            loop {
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                mcts.search_iters(BATCH_SIZE, &mut rng);
+                let iters = mcts.total_visits();
+                let best = mcts.best_moves(3);
+                if tx.send((best, iters)).is_err() {
+                    break;
+                }
+            }
         });
+
         self.result_rx = Some(rx);
-        self.computing = true;
     }
 
     fn handle_click(&mut self, pos: Pos) {
@@ -77,27 +101,20 @@ impl App {
         if self.game.place(pos) {
             self.last_pos = Some(pos);
             self.suggestions.clear();
-            // Drop any running computation and start a new one.
-            self.result_rx = None;
-            self.computing = false;
-            if !self.game.is_terminal() {
-                self.start_mcts();
-            }
+            self.restart_mcts();
         }
     }
 
     fn reset(&mut self) {
         self.game = GameState::new();
         self.suggestions.clear();
-        self.computing = false;
-        self.result_rx = None;
         self.last_pos = None;
         self.pan_offset = egui::Vec2::ZERO;
-        self.start_mcts();
+        self.restart_mcts();
     }
 }
 
-// ── Hex geometry helpers ─────────────────────────────────────────────────────
+// ── Hex geometry ──────────────────────────────────────────────────────────────
 
 fn hex_to_pixel(q: i32, r: i32, size: f32, origin: Pos2) -> Pos2 {
     Pos2::new(
@@ -109,9 +126,10 @@ fn hex_to_pixel(q: i32, r: i32, size: f32, origin: Pos2) -> Pos2 {
 fn pixel_to_hex(p: Pos2, size: f32, origin: Pos2) -> Pos {
     let x = p.x - origin.x;
     let y = p.y - origin.y;
-    let fq = (3f32.sqrt() / 3.0 * x - 1.0 / 3.0 * y) / size;
-    let fr = 2.0 / 3.0 * y / size;
-    hex_round(fq, fr)
+    hex_round(
+        (3f32.sqrt() / 3.0 * x - 1.0 / 3.0 * y) / size,
+        (2.0 / 3.0 * y) / size,
+    )
 }
 
 fn hex_round(fq: f32, fr: f32) -> Pos {
@@ -131,7 +149,6 @@ fn hex_round(fq: f32, fr: f32) -> Pos {
     }
 }
 
-/// Six corners of a pointy-top hexagon centred at `centre`.
 fn hex_corners(centre: Pos2, size: f32) -> [Pos2; 6] {
     std::array::from_fn(|i| {
         let angle = std::f32::consts::FRAC_PI_6 + std::f32::consts::FRAC_PI_3 * i as f32;
@@ -139,124 +156,196 @@ fn hex_corners(centre: Pos2, size: f32) -> [Pos2; 6] {
     })
 }
 
-// ── egui App impl ─────────────────────────────────────────────────────────────
+// ── Colour helpers ────────────────────────────────────────────────────────────
+
+fn player_color(p: Player) -> Color32 {
+    match p {
+        Player::X => Color32::from_rgb(70, 140, 220),
+        Player::O => Color32::from_rgb(220, 70, 70),
+    }
+}
+
+fn player_dark(p: Player) -> Color32 {
+    match p {
+        Player::X => Color32::from_rgb(45, 95, 165),
+        Player::O => Color32::from_rgb(165, 45, 45),
+    }
+}
+
+fn cell_fill(
+    pos: Pos,
+    game: &GameState,
+    win_cells: &std::collections::HashSet<Pos>,
+    suggestion_rank: Option<usize>,
+    hovered: Option<Pos>,
+) -> Color32 {
+    if let Some(player) = game.board.get(&pos) {
+        return if win_cells.contains(&pos) {
+            match player {
+                Player::X => Color32::from_rgb(110, 195, 255),
+                Player::O => Color32::from_rgb(255, 120, 120),
+            }
+        } else {
+            player_dark(*player)
+        };
+    }
+    if Some(pos) == hovered && !game.is_terminal() {
+        return Color32::from_gray(95);
+    }
+    if let Some(rank) = suggestion_rank {
+        return match rank {
+            0 => Color32::from_rgb(45, 185, 45),
+            1 => Color32::from_rgb(130, 190, 45),
+            _ => Color32::from_rgb(175, 190, 45),
+        };
+    }
+    Color32::from_gray(52)
+}
+
+// ── egui App ──────────────────────────────────────────────────────────────────
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Poll MCTS background thread.
+        // Drain all pending MCTS results — keep the latest.
         if let Some(rx) = &self.result_rx {
-            if let Ok(results) = rx.try_recv() {
-                self.suggestions = results.into_iter().take(3).collect();
-                self.computing = false;
-                self.result_rx = None;
-            } else {
-                ctx.request_repaint(); // keep polling
+            let mut latest = None;
+            while let Ok(msg) = rx.try_recv() {
+                latest = Some(msg);
             }
+            if let Some((best, iters)) = latest {
+                self.suggestions = best;
+                self.mcts_iters = iters;
+            }
+            ctx.request_repaint(); // keep polling every frame
         }
 
-        // ── Side panel ───────────────────────────────────────────────────────
+        // ── Side panel ────────────────────────────────────────────────────
         egui::SidePanel::right("side")
-            .min_width(210.0)
-            .max_width(210.0)
+            .exact_width(230.0)
             .show(ctx, |ui| {
-                ui.add_space(8.0);
-                ui.heading("Hextoe");
-                ui.separator();
+                ui.add_space(10.0);
 
+                // ── Prominent player indicator ─────────────────────────────
                 if let Some(winner) = self.game.winner {
-                    let color = player_color(winner);
-                    ui.colored_label(color, format!("{:?} wins!", winner));
+                    egui::Frame::none()
+                        .fill(player_color(winner))
+                        .inner_margin(egui::Margin::symmetric(10.0, 14.0))
+                        .rounding(egui::Rounding::same(8.0))
+                        .show(ui, |ui| {
+                            ui.with_layout(
+                                egui::Layout::top_down(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        RichText::new(format!("{winner:?} wins!"))
+                                            .size(26.0)
+                                            .color(Color32::WHITE)
+                                            .strong(),
+                                    );
+                                },
+                            );
+                        });
                 } else {
                     let player = self.game.current_player();
-                    ui.colored_label(
-                        player_color(player),
-                        format!(
-                            "{:?}'s turn — {}",
-                            player,
-                            self.game.turn_label()
-                        ),
-                    );
+                    let col = player_color(player);
+                    egui::Frame::none()
+                        .fill(col)
+                        .inner_margin(egui::Margin::symmetric(10.0, 10.0))
+                        .rounding(egui::Rounding::same(8.0))
+                        .show(ui, |ui| {
+                            ui.with_layout(
+                                egui::Layout::top_down(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        RichText::new(format!("{player:?} to move"))
+                                            .size(22.0)
+                                            .color(Color32::WHITE)
+                                            .strong(),
+                                    );
+                                    ui.label(
+                                        RichText::new(self.game.turn_label())
+                                            .size(14.0)
+                                            .color(Color32::from_rgba_unmultiplied(
+                                                255, 255, 255, 200,
+                                            )),
+                                    );
+                                },
+                            );
+                        });
                 }
 
+                ui.add_space(8.0);
                 ui.separator();
+                ui.add_space(4.0);
 
-                if self.computing {
-                    ui.label("Computing suggestions…");
+                // ── MCTS suggestions ───────────────────────────────────────
+                if self.game.is_terminal() {
+                    // nothing
+                } else if self.suggestions.is_empty() {
+                    ui.label("Analysing…");
                     ui.spinner();
-                } else if self.suggestions.is_empty() && !self.game.is_terminal() {
-                    ui.label("No suggestions yet.");
                 } else {
-                    ui.label("Top suggestions:");
+                    ui.label(format!(
+                        "Top moves  ({} iters)",
+                        fmt_iters(self.mcts_iters)
+                    ));
+                    ui.add_space(2.0);
                     for (rank, (pos, wr)) in self.suggestions.iter().enumerate() {
                         let marker = ["①", "②", "③"][rank];
-                        ui.label(format!(
-                            "{} ({},{})  {:.0}%",
-                            marker,
-                            pos.0,
-                            pos.1,
-                            wr * 100.0
-                        ));
+                        let col = match rank {
+                            0 => Color32::from_rgb(45, 185, 45),
+                            1 => Color32::from_rgb(130, 190, 45),
+                            _ => Color32::from_rgb(175, 190, 45),
+                        };
+                        ui.colored_label(
+                            col,
+                            format!("{marker} ({},{})  {:.0}%", pos.0, pos.1, wr * 100.0),
+                        );
                     }
                 }
 
+                ui.add_space(8.0);
                 ui.separator();
-                ui.label("Rules");
+                ui.add_space(4.0);
+
+                ui.label(
+                    RichText::new("Rules").strong(),
+                );
                 ui.label("• 6 in a row wins");
                 ui.label("• X plays 1 anchor move");
-                ui.label("• Then: OO XX OO XX …");
-                ui.separator();
-                ui.label("Controls");
-                ui.label("• Click to place");
-                ui.label("• Drag to pan");
+                ui.label("• Then pairs: OO XX OO…");
 
+                ui.add_space(4.0);
+                ui.label(RichText::new("Controls").strong());
+                ui.label("• Click to place a piece");
+                ui.label("• Drag to pan the board");
+
+                ui.add_space(10.0);
                 ui.separator();
-                if ui.button("New Game").clicked() {
+                if ui
+                    .add_sized([210.0, 32.0], egui::Button::new("New Game"))
+                    .clicked()
+                {
                     self.reset();
                 }
             });
 
-        // ── Central panel (board) ─────────────────────────────────────────────
+        // ── Board panel ───────────────────────────────────────────────────
         egui::CentralPanel::default().show(ctx, |ui| {
             let rect = ui.available_rect_before_wrap();
             let origin = rect.center() + self.pan_offset;
 
-            // Handle pan (drag).
             let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
 
-            if response.drag_started() {
-                self.drag_start = ctx.pointer_interact_pos();
-            }
             if response.dragged() {
                 self.pan_offset += response.drag_delta();
             }
 
-            // Determine cells to render.
-            let mut cells: std::collections::HashSet<Pos> = self.game.board.keys().copied().collect();
-
-            if cells.is_empty() {
-                // Initial view: small grid around origin.
-                for dq in -3i32..=3 {
-                    let dr_lo = (-3i32).max(-dq - 3);
-                    let dr_hi = 3i32.min(-dq + 3);
-                    for dr in dr_lo..=dr_hi {
-                        cells.insert((dq, dr));
-                    }
-                }
-            }
-
-            // Show candidate cells (valid next moves) as empty hexes.
-            for &p in &self.game.candidates {
-                cells.insert(p);
-            }
-
-            // Winning line cells.
+            // Determine winning line.
             let win_cells: std::collections::HashSet<Pos> =
-                if let (Some(winner), Some(last)) = (self.game.winner, self.last_pos) {
-                    winning_line(&self.game.board, last, winner)
-                        .into_iter()
-                        .collect()
+                if let (Some(w), Some(last)) = (self.game.winner, self.last_pos) {
+                    winning_line(&self.game.board, last, w).into_iter().collect()
                 } else {
-                    std::collections::HashSet::new()
+                    Default::default()
                 };
 
             let suggestion_map: std::collections::HashMap<Pos, (usize, f32)> = self
@@ -266,10 +355,26 @@ impl eframe::App for App {
                 .map(|(i, &(p, wr))| (p, (i, wr)))
                 .collect();
 
+            // Cells to render.
+            let mut cells: std::collections::HashSet<Pos> =
+                self.game.board.keys().copied().collect();
+            if cells.is_empty() {
+                for dq in -3i32..=3 {
+                    for dr in (-3i32).max(-dq - 3)..=3i32.min(-dq + 3) {
+                        cells.insert((dq, dr));
+                    }
+                }
+            }
+            for &p in &self.game.candidates {
+                cells.insert(p);
+            }
+            for &(p, _) in &self.suggestions {
+                cells.insert(p);
+            }
+
             let painter = ui.painter_at(rect);
 
-            // Draw hover highlight.
-            let hovered_hex = ctx.pointer_hover_pos().and_then(|p| {
+            let hovered = ctx.pointer_hover_pos().and_then(|p| {
                 if rect.contains(p) && !self.game.is_terminal() {
                     Some(pixel_to_hex(p, HEX_SIZE, origin))
                 } else {
@@ -277,113 +382,65 @@ impl eframe::App for App {
                 }
             });
 
+            let expanded = rect.expand(HEX_SIZE * 3.0);
             for pos in &cells {
                 let centre = hex_to_pixel(pos.0, pos.1, HEX_SIZE, origin);
-                // Cull cells outside the visible rect (with margin).
-                if !rect.expand(HEX_SIZE * 2.0).contains(centre) {
+                if !expanded.contains(centre) {
                     continue;
                 }
-                let corners: Vec<Pos2> = hex_corners(centre, HEX_SIZE - 1.0).into();
 
-                let fill = cell_fill(
-                    *pos,
-                    &self.game,
-                    &win_cells,
-                    &suggestion_map,
-                    hovered_hex,
-                );
-                let stroke_color = if win_cells.contains(pos) {
+                let sug_rank = suggestion_map.get(pos).map(|&(r, _)| r);
+                let corners: Vec<Pos2> = hex_corners(centre, HEX_SIZE - 1.5).into();
+                let fill = cell_fill(*pos, &self.game, &win_cells, sug_rank, hovered);
+                let stroke_col = if win_cells.contains(pos) {
                     Color32::YELLOW
                 } else {
-                    Color32::from_gray(40)
+                    Color32::from_gray(35)
                 };
-                let stroke_width = if win_cells.contains(pos) { 2.5 } else { 1.0 };
 
                 painter.add(egui::Shape::convex_polygon(
                     corners,
                     fill,
-                    Stroke::new(stroke_width, stroke_color),
+                    Stroke::new(if win_cells.contains(pos) { 2.5 } else { 1.0 }, stroke_col),
                 ));
 
-                // Label: piece or suggestion percentage.
-                match self.game.board.get(pos) {
-                    Some(p) => {
-                        let label = if *p == Player::X { "X" } else { "O" };
-                        painter.text(
-                            centre,
-                            egui::Align2::CENTER_CENTER,
-                            label,
-                            FontId::proportional(HEX_SIZE * 0.65),
-                            Color32::WHITE,
-                        );
-                    }
-                    None => {
-                        if let Some(&(rank, wr)) = suggestion_map.get(pos) {
-                            let marker = ["①", "②", "③"][rank];
-                            painter.text(
-                                centre,
-                                egui::Align2::CENTER_CENTER,
-                                format!("{}\n{:.0}%", marker, wr * 100.0),
-                                FontId::proportional(HEX_SIZE * 0.38),
-                                Color32::BLACK,
-                            );
-                        }
-                    }
+                // Labels.
+                if let Some(player) = self.game.board.get(pos) {
+                    painter.text(
+                        centre,
+                        egui::Align2::CENTER_CENTER,
+                        if *player == Player::X { "X" } else { "O" },
+                        FontId::proportional(HEX_SIZE * 0.65),
+                        Color32::WHITE,
+                    );
+                } else if let Some(&(rank, wr)) = suggestion_map.get(pos) {
+                    let marker = ["①", "②", "③"][rank];
+                    painter.text(
+                        centre,
+                        egui::Align2::CENTER_CENTER,
+                        format!("{marker}\n{:.0}%", wr * 100.0),
+                        FontId::proportional(HEX_SIZE * 0.36),
+                        Color32::BLACK,
+                    );
                 }
             }
 
-            // Handle click (not drag).
+            // Handle click.
             if response.clicked() {
-                if let Some(click_pos) = response.interact_pointer_pos() {
-                    let hex = pixel_to_hex(click_pos, HEX_SIZE, origin);
-                    self.handle_click(hex);
+                if let Some(click) = response.interact_pointer_pos() {
+                    self.handle_click(pixel_to_hex(click, HEX_SIZE, origin));
                 }
             }
         });
     }
 }
 
-// ── Colour helpers ────────────────────────────────────────────────────────────
-
-fn player_color(p: Player) -> Color32 {
-    match p {
-        Player::X => Color32::from_rgb(100, 160, 230),
-        Player::O => Color32::from_rgb(230, 90, 90),
+fn fmt_iters(n: u32) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f32 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f32 / 1_000.0)
+    } else {
+        format!("{n}")
     }
-}
-
-fn cell_fill(
-    pos: Pos,
-    game: &GameState,
-    win_cells: &std::collections::HashSet<Pos>,
-    suggestion_map: &std::collections::HashMap<Pos, (usize, f32)>,
-    hovered: Option<Pos>,
-) -> Color32 {
-    if let Some(player) = game.board.get(&pos) {
-        if win_cells.contains(&pos) {
-            // Winning piece: brighter highlight.
-            return match player {
-                Player::X => Color32::from_rgb(60, 180, 255),
-                Player::O => Color32::from_rgb(255, 80, 80),
-            };
-        }
-        return match player {
-            Player::X => Color32::from_rgb(60, 110, 175),
-            Player::O => Color32::from_rgb(185, 55, 55),
-        };
-    }
-
-    if Some(pos) == hovered && !game.is_terminal() {
-        return Color32::from_gray(90);
-    }
-
-    if let Some(&(rank, _)) = suggestion_map.get(&pos) {
-        return match rank {
-            0 => Color32::from_rgb(60, 185, 60),
-            1 => Color32::from_rgb(140, 195, 60),
-            _ => Color32::from_rgb(185, 195, 60),
-        };
-    }
-
-    Color32::from_gray(55)
 }
