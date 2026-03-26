@@ -211,9 +211,17 @@ impl Mcts {
         copy_node(self, other, root_id)
     }
 
-    /// Return the top-`top_n` root children sorted by descending win-rate.
-    /// Each entry is `(pos, win_rate, visits, policy_share)` where `policy_share`
+    /// Return the top-`top_n` root children sorted by descending score.
+    /// Each entry is `(pos, score_0_1, visits, policy_share)` where `policy_share`
     /// is `visits / root_visits` (fraction of simulations that took that edge from root).
+    ///
+    /// For **non-terminal** children, `score_0_1` is `(mean_backup + 1) / 2` with
+    /// `mean_backup` the average MCTS backup target in `[-1, 1]` (random rollout
+    /// outcomes and/or neural value at the leaf). That is an **estimate**, not an
+    /// exact win probability unless rollouts are unbiased playouts to terminal.
+    /// For **terminal** children, the score is the exact outcome from [`Node::state`]
+    /// (win / loss / draw for [`Self::root_player`]), ignoring any float noise in
+    /// accumulated `total_value`.
     pub fn best_moves(&self, top_n: usize) -> Vec<(Pos, f32, u32, f32)> {
         let root_visits = self.nodes[0].visits;
         let root_children = self.nodes[0].children.clone();
@@ -222,11 +230,7 @@ impl Mcts {
             .filter_map(|&cid| {
                 let n = &self.nodes[cid];
                 let pos = n.action?;
-                let win_rate = if n.visits > 0 {
-                    (n.total_value / n.visits as f32 + 1.0) / 2.0
-                } else {
-                    0.5
-                };
+                let win_rate = self.root_child_display_score(n);
                 let policy_share = if root_visits > 0 {
                     n.visits as f32 / root_visits as f32
                 } else {
@@ -238,6 +242,22 @@ impl Mcts {
         results.sort_by(|a, b| b.1.total_cmp(&a.1));
         results.truncate(top_n);
         results
+    }
+
+    /// Map stored backups to a `[0, 1]` display score; terminal positions use exact result.
+    fn root_child_display_score(&self, n: &Node) -> f32 {
+        if n.state.is_terminal() {
+            return match n.state.winner {
+                Some(p) if p == self.root_player => 1.0,
+                Some(_) => 0.0,
+                None => 0.5,
+            };
+        }
+        if n.visits > 0 {
+            (n.total_value / n.visits as f32 + 1.0) / 2.0
+        } else {
+            0.5
+        }
     }
 
     /// Total iterations run so far (= root visit count).
@@ -258,8 +278,8 @@ impl Mcts {
     }
 
     /// Run `iterations` MCTS iterations and return all root children sorted by
-    /// descending estimated win-rate (in [0,1]) from root_player's perspective.
-    /// Tuple is `(pos, win_rate, visits, policy_share)`; see [`Self::best_moves`].
+    /// descending score (in [0,1]); see [`Self::best_moves`].
+    /// Tuple is `(pos, score, visits, policy_share)`.
     pub fn search<P: RolloutPolicy>(
         &mut self,
         iterations: u32,
@@ -402,5 +422,65 @@ mod tests {
         let before = m.nodes[0].visits;
         m.search_iters(80, &mut rng, &rollout);
         assert_eq!(m.nodes[0].visits, before + 80);
+    }
+
+    /// X has 5 in a row on axis (1,0); playing (5,0) wins immediately (see `game` tests).
+    fn state_x_one_move_wins() -> GameState {
+        let moves = [
+            (0, 0),
+            (0, 20),
+            (20, 0),
+            (1, 0),
+            (2, 0),
+            (-20, 0),
+            (0, -20),
+            (3, 0),
+            (4, 0),
+            (20, 20),
+            (-20, 20),
+        ];
+        let mut g = GameState::new();
+        for &m in &moves {
+            assert!(g.place(m), "illegal move {m:?}");
+        }
+        g
+    }
+
+    #[test]
+    fn immediate_win_move_has_perfect_q_serial_and_parallel() {
+        let g = state_x_one_move_wins();
+        assert_eq!(g.current_player(), Player::X);
+        assert!(g.legal_actions().contains(&(5, 0)));
+        assert!(!g.is_terminal());
+
+        let rollout = RandomRollout;
+        let n = 8_000u32;
+
+        let mut serial = Mcts::new(g.clone());
+        let mut rng = StdRng::seed_from_u64(99);
+        serial.search_iters_serial(n, &mut rng, &rollout);
+        let q_serial = child_q(&serial, (5, 0));
+
+        let mut parallel = Mcts::new(g);
+        parallel.search_iters_parallel(n);
+        let q_parallel = child_q(&parallel, (5, 0));
+
+        assert!(
+            (q_serial - 1.0).abs() < 1e-3,
+            "serial Q for winning move should be 1.0, got {q_serial}"
+        );
+        assert!(
+            (q_parallel - 1.0).abs() < 1e-3,
+            "parallel Q for winning move should be 1.0, got {q_parallel}"
+        );
+    }
+
+    fn child_q(m: &Mcts, pos: Pos) -> f32 {
+        let id = m
+            .find_root_child(pos)
+            .unwrap_or_else(|| panic!("no root child for {pos:?}"));
+        let n = &m.nodes[id];
+        assert!(n.visits > 0, "child {pos:?} never visited");
+        n.total_value / n.visits as f32
     }
 }

@@ -34,7 +34,7 @@ struct App {
     game: GameState,
     /// A training checkpoint exists (latest / best / legacy); each MCTS thread loads its own copy.
     nn_checkpoint_hint: bool,
-    /// Current best suggestions: (pos, win_rate, visits, policy_share).
+    /// Current best suggestions: (pos, score 0–1, visits, policy_share).
     suggestions: Vec<(Pos, f32, u32, f32)>,
     /// Total MCTS iterations accumulated since the last move.
     mcts_iters: u32,
@@ -307,15 +307,17 @@ impl eframe::App for App {
                 } else {
                     if self.nn_checkpoint_hint {
                         ui.label(
-                            RichText::new("Analysis: trained policy rollouts")
-                                .size(12.0)
-                                .color(Color32::from_rgb(120, 200, 140)),
+                            RichText::new(
+                                "Analysis: NN value at leaves (AlphaZero-style; not MC win %)",
+                            )
+                            .size(12.0)
+                            .color(Color32::from_rgb(120, 200, 140)),
                         );
                         ui.add_space(4.0);
                     } else {
                         ui.label(
                             RichText::new(
-                                "No checkpoint (latest / best / legacy) — random rollouts",
+                                "No checkpoint — random rollouts to terminal (MC win estimate)",
                             )
                             .size(11.0)
                             .color(Color32::from_rgb(200, 160, 90)),
@@ -323,7 +325,7 @@ impl eframe::App for App {
                         ui.add_space(4.0);
                     }
                     ui.label(format!(
-                        "Top moves  ({} iters)",
+                        "Top moves — score 0–100% ({} iters)",
                         fmt_iters(self.mcts_iters)
                     ));
                     ui.add_space(2.0);
