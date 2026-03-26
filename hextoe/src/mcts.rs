@@ -6,10 +6,7 @@
 ///   enumeration never rescans the full board.
 /// - Rewards are stored from a fixed root-player perspective, avoiding
 ///   per-level sign bookkeeping that breaks for 2-moves-per-turn games.
-use crate::game::{
-    find_immediate_win_move, find_two_move_win_first, is_first_move_of_pair, GameState, Player,
-    Pos,
-};
+use crate::game::{GameState, Player, Pos};
 use rand::Rng;
 use rayon::prelude::*;
 
@@ -31,9 +28,50 @@ pub trait RolloutPolicy {
 /// Uniform random playouts (used by the GUI and benchmarks).
 pub struct RandomRollout;
 
+/// Last two placements by one side; used to prefer “keep going” along `prev → last`.
+#[derive(Default)]
+struct LastTwoMoves {
+    prev: Option<Pos>,
+    last: Option<Pos>,
+}
+
+impl LastTwoMoves {
+    fn record(&mut self, pos: Pos) {
+        self.prev = self.last;
+        self.last = Some(pos);
+    }
+
+    /// One step further in the same direction as `prev → last` (vector `last - prev`).
+    fn continuation(&self) -> Option<Pos> {
+        let (prev, last) = (self.prev?, self.last?);
+        Some((last.0 + (last.0 - prev.0), last.1 + (last.1 - prev.1)))
+    }
+}
+
+fn rollout_pick_action(
+    state: &GameState,
+    actions: &[Pos],
+    x_hist: &LastTwoMoves,
+    o_hist: &LastTwoMoves,
+    rng: &mut impl Rng,
+) -> Pos {
+    let hist = match state.current_player() {
+        Player::X => x_hist,
+        Player::O => o_hist,
+    };
+    if let Some(c) = hist.continuation() {
+        if actions.iter().any(|&a| a == c) {
+            return c;
+        }
+    }
+    actions[rng.gen_range(0..actions.len())]
+}
+
 impl RolloutPolicy for RandomRollout {
     fn rollout(&self, mut state: GameState, root_player: Player, rng: &mut impl Rng) -> f32 {
         let mut ply = 0u32;
+        let mut x_hist = LastTwoMoves::default();
+        let mut o_hist = LastTwoMoves::default();
         while !state.is_terminal() {
             if ply >= MAX_GAME_MOVES {
                 return 0.0;
@@ -42,16 +80,13 @@ impl RolloutPolicy for RandomRollout {
             if actions.is_empty() {
                 break;
             }
-            let action = find_immediate_win_move(&state)
-                .or_else(|| {
-                    if is_first_move_of_pair(&state) {
-                        find_two_move_win_first(&state)
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or_else(|| actions[rng.gen_range(0..actions.len())]);
+            let action = rollout_pick_action(&state, &actions, &x_hist, &o_hist, rng);
+            let who = state.current_player();
             state.place(action);
+            match who {
+                Player::X => x_hist.record(action),
+                Player::O => o_hist.record(action),
+            }
             ply += 1;
         }
         match state.winner {
@@ -413,6 +448,14 @@ mod tests {
     use rand::SeedableRng;
 
     #[test]
+    fn last_two_moves_continues_straight_line() {
+        let mut h = LastTwoMoves::default();
+        h.record((0, 0));
+        h.record((1, 0));
+        assert_eq!(h.continuation(), Some((2, 0)));
+    }
+
+    #[test]
     fn search_iters_accumulates_root_visits() {
         let mut m = Mcts::new(GameState::new());
         let mut rng = StdRng::seed_from_u64(42);
@@ -465,8 +508,7 @@ mod tests {
         assert!(!g.is_terminal());
 
         let rollout = RandomRollout;
-        // Enough for Q → 1 on the forced win; keep moderate so `cargo test` (debug) stays usable.
-        let n = 600u32;
+        let n = 8_000u32;
 
         let mut serial = Mcts::new(g.clone());
         let mut rng = StdRng::seed_from_u64(99);
