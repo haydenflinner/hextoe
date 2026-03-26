@@ -15,6 +15,10 @@ const C: f32 = std::f32::consts::SQRT_2;
 /// Maximum plies in a game or in a single MCTS rollout (avoids infinite loops).
 pub const MAX_GAME_MOVES: u32 = 100;
 
+/// When a straight-line continuation exists, use it with this probability; otherwise sample
+/// uniformly over all legal moves (so continuation is never the only option).
+const ROLLOUT_CONTINUATION_BIAS: f32 = 0.35;
+
 /// Plays out a position to a terminal state and returns reward from `root_player`'s
 /// perspective: +1 / -1 / 0.
 pub trait RolloutPolicy {
@@ -59,8 +63,9 @@ fn rollout_pick_action(
         Player::X => x_hist,
         Player::O => o_hist,
     };
-    if let Some(c) = hist.continuation() {
-        if actions.iter().any(|&a| a == c) {
+    let continuation = hist.continuation().filter(|&c| actions.iter().any(|&a| a == c));
+    if let Some(c) = continuation {
+        if rng.gen::<f32>() < ROLLOUT_CONTINUATION_BIAS {
             return c;
         }
     }
