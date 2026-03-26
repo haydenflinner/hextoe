@@ -9,9 +9,11 @@
 /// where G = encode::GRID = 21.
 use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::{conv2d, linear, Conv2d, Conv2dConfig, Linear, Module, VarBuilder, VarMap};
+use rand::Rng;
 
-use crate::encode::{action_to_index, board_center, encode_state, CHANNELS, GRID};
-use crate::game::GameState;
+use crate::encode::{action_to_index, board_center, encode_state, index_to_action, CHANNELS, GRID};
+use crate::game::{GameState, Player};
+use crate::mcts::{RandomRollout, RolloutPolicy, MAX_GAME_MOVES};
 
 const HIDDEN: usize = 64;
 const RES_BLOCKS: usize = 4;
@@ -134,6 +136,69 @@ impl HextoeNet {
 
         Ok((probs_vec, v))
     }
+}
+
+/// Sample a flat action index from a masked policy vector (illegal entries are ~0).
+pub fn sample_policy_index(probs: &[f32], rng: &mut impl Rng) -> usize {
+    let sum: f32 = probs.iter().copied().filter(|p| p.is_finite() && *p > 0.0).sum();
+    if !(sum > 0.0) {
+        return rng.gen_range(0..probs.len());
+    }
+    let t = rng.gen::<f32>() * sum;
+    let mut c = 0.0f32;
+    for (i, &p) in probs.iter().enumerate() {
+        c += p.max(0.0);
+        if c >= t {
+            return i;
+        }
+    }
+    probs.len().saturating_sub(1)
+}
+
+/// MCTS rollout policy: play out with the network policy until terminal (AlphaZero-style).
+pub struct NeuralRollout<'a> {
+    pub net: &'a HextoeNet,
+    pub device: &'a Device,
+}
+
+impl RolloutPolicy for NeuralRollout<'_> {
+    fn rollout(&mut self, mut state: GameState, root_player: Player, rng: &mut impl Rng) -> f32 {
+        let mut ply = 0u32;
+        while !state.is_terminal() {
+            if ply >= MAX_GAME_MOVES {
+                return 0.0;
+            }
+            let actions = state.legal_actions();
+            if actions.is_empty() {
+                break;
+            }
+            let center = board_center(&state);
+            let pos = match self.net.evaluate_state(&state, self.device) {
+                Ok((probs, _)) => {
+                    let idx = sample_policy_index(&probs, rng);
+                    let pos = index_to_action(idx, center);
+                    if actions.contains(&pos) {
+                        pos
+                    } else {
+                        actions[rng.gen_range(0..actions.len())]
+                    }
+                }
+                Err(_) => {
+                    let mut fallback = RandomRollout;
+                    return fallback.rollout(state, root_player, rng);
+                }
+            };
+            state.place(pos);
+            ply += 1;
+        }
+        match state.winner {
+            Some(p) if p == root_player => 1.0,
+            Some(_) => -1.0,
+            None => 0.0,
+        }
+    }
+
+    const PARALLEL_SAFE: bool = false;
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

@@ -1,19 +1,21 @@
 //! hextoe-train — self-play reinforcement learning loop (AlphaZero style).
 //!
 //! Runs indefinitely:
-//!   1. Generate GAMES_PER_ITER self-play games using pure MCTS.
+//!   1. Generate GAMES_PER_ITER self-play games using MCTS with NN policy rollouts.
 //!   2. Fill a replay buffer with (state, π, z) training records.
 //!   3. Once the buffer is large enough, run TRAIN_STEPS gradient-descent steps.
 //!   4. Save a checkpoint.
 //!
 //! The saved model can later be loaded by the GUI for NN-guided play.
 //!
+//! Games and MCTS rollouts are capped at 1000 plies (`hextoe::mcts::MAX_GAME_MOVES`).
+//!
 //! Usage:  cargo run --release --bin hextoe-train
 
 use candle_core::{Device, DType, Tensor};
 use candle_nn::{optim::AdamW, optim::ParamsAdamW, Optimizer, VarBuilder, VarMap};
 use hextoe::encode::{CHANNELS, GRID};
-use hextoe::nn::{load_weights, save_weights, HextoeNet};
+use hextoe::nn::{load_weights, save_weights, HextoeNet, NeuralRollout};
 use hextoe::self_play::{ReplayBuffer, SelfPlayCollector};
 use rand::SeedableRng;
 
@@ -68,8 +70,12 @@ fn run() -> candle_core::Result<()> {
 
         // ── Self-play ──────────────────────────────────────────────────────
         let mut new_records = 0usize;
+        let mut nn_rollout = NeuralRollout {
+            net: &model,
+            device: &device,
+        };
         for _ in 0..GAMES_PER_ITER {
-            let records = collector.play_game(MCTS_ITERS_PER_MOVE, &mut rng);
+            let records = collector.play_game(MCTS_ITERS_PER_MOVE, &mut rng, &mut nn_rollout);
             new_records += records.len();
             for r in records {
                 buffer.push(r);

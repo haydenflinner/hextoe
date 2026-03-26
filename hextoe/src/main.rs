@@ -1,5 +1,5 @@
 use hextoe::game::{winning_line, GameState, Player, Pos};
-use hextoe::mcts::Mcts;
+use hextoe::mcts::{Mcts, RandomRollout};
 
 use eframe::egui;
 use egui::{Color32, FontId, Pos2, RichText, Stroke};
@@ -78,11 +78,12 @@ impl App {
         thread::spawn(move || {
             let mut rng = rand::thread_rng();
             let mut mcts = Mcts::new(game);
+            let mut rollout = RandomRollout;
             loop {
                 if cancel.load(Ordering::Relaxed) {
                     break;
                 }
-                mcts.search_iters(BATCH_SIZE, &mut rng);
+                mcts.search_iters(BATCH_SIZE, &mut rng, &mut rollout);
                 let iters = mcts.total_visits();
                 let best = mcts.best_moves(3);
                 if tx.send((best, iters)).is_err() {

@@ -1,3 +1,4 @@
 target
 ref
 hextoe_model.safetensors
+.DS_Store

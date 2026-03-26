@@ -1,6 +1,6 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use hextoe::game::GameState;
-use hextoe::mcts::Mcts;
+use hextoe::mcts::{Mcts, RandomRollout};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -57,7 +57,8 @@ fn bench_mcts(c: &mut Criterion) {
             b.iter(|| {
                 let mut rng = rand::thread_rng();
                 let mut mcts = Mcts::new(GameState::new());
-                mcts.search_iters(n, &mut rng);
+                let mut rollout = RandomRollout;
+                mcts.search_iters(n, &mut rng, &mut rollout);
             })
         });
     }
@@ -68,7 +69,8 @@ fn bench_mcts_best_moves(c: &mut Criterion) {
     // Pre-warm a tree with 1000 iterations; then benchmark best_moves extraction.
     let mut rng = rand::thread_rng();
     let mut mcts = Mcts::new(GameState::new());
-    mcts.search_iters(1_000, &mut rng);
+    let mut rollout = RandomRollout;
+    mcts.search_iters(1_000, &mut rng, &mut rollout);
     c.bench_function("best_moves_top3", |b| b.iter(|| mcts.best_moves(3)));
 }
 

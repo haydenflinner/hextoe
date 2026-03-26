@@ -2,7 +2,7 @@ use rand::Rng;
 
 use crate::encode::{action_to_index, board_center, encode_state, CHANNELS, GRID};
 use crate::game::{GameState, Player, Pos};
-use crate::mcts::Mcts;
+use crate::mcts::{Mcts, RolloutPolicy, MAX_GAME_MOVES};
 
 // ── Data structures ───────────────────────────────────────────────────────────
 
@@ -94,14 +94,23 @@ impl SelfPlayCollector {
     ///
     /// After the game terminates, set each record's `outcome` to +1/-1/0
     /// from the perspective of the player who was to move at that step.
-    pub fn play_game<R: Rng>(&self, mcts_iters: u32, rng: &mut R) -> Vec<GameRecord> {
+    pub fn play_game<R: Rng, P: RolloutPolicy>(
+        &self,
+        mcts_iters: u32,
+        rng: &mut R,
+        rollout: &mut P,
+    ) -> Vec<GameRecord> {
         let mut state = GameState::new();
         // Temporary storage: (encoded_state, pi, player_to_move)
         let mut steps: Vec<([f32; CHANNELS * GRID * GRID], [f32; GRID * GRID], Player)> =
             Vec::new();
+        let mut move_count = 0u32;
 
         loop {
             if state.is_terminal() {
+                break;
+            }
+            if move_count >= MAX_GAME_MOVES {
                 break;
             }
 
@@ -112,7 +121,7 @@ impl SelfPlayCollector {
 
             // ----- run MCTS -----
             let mut mcts = Mcts::new(state.clone());
-            mcts.search_iters(mcts_iters, rng);
+            mcts.search_iters(mcts_iters, rng, rollout);
 
             let children_stats: Vec<(Pos, u32)> = mcts.root_children_stats();
 
@@ -149,6 +158,7 @@ impl SelfPlayCollector {
 
             steps.push((state_enc, pi, current_player));
             state.place(chosen_pos);
+            move_count += 1;
         }
 
         // ----- assign outcomes -----
