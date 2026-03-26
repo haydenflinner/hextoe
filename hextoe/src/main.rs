@@ -93,15 +93,15 @@ impl App {
                 }
                 match &loaded_nn {
                     Some(ld) => {
-                        let mut r = NeuralRollout {
+                        let r = NeuralRollout {
                             net: &ld.net,
                             device: &device,
                         };
-                        mcts.search_iters(BATCH_SIZE, &mut rng, &mut r);
+                        mcts.search_iters(BATCH_SIZE, &mut rng, &r);
                     }
                     None => {
-                        let mut r = RandomRollout;
-                        mcts.search_iters(BATCH_SIZE, &mut rng, &mut r);
+                        let r = RandomRollout;
+                        mcts.search_iters(BATCH_SIZE, &mut rng, &r);
                     }
                 }
                 let iters = mcts.total_visits();

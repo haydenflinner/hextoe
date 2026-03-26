@@ -18,7 +18,7 @@ pub const MAX_GAME_MOVES: u32 = 100;
 /// Plays out a position to a terminal state and returns reward from `root_player`'s
 /// perspective: +1 / -1 / 0.
 pub trait RolloutPolicy {
-    fn rollout(&mut self, state: GameState, root_player: Player, rng: &mut impl Rng) -> f32;
+    fn rollout(&self, state: GameState, root_player: Player, rng: &mut impl Rng) -> f32;
 
     /// If true, root-parallel search may use an equivalent stateless rollout
     /// ([`RandomRollout`] only). Other policies always run serially.
@@ -29,7 +29,7 @@ pub trait RolloutPolicy {
 pub struct RandomRollout;
 
 impl RolloutPolicy for RandomRollout {
-    fn rollout(&mut self, mut state: GameState, root_player: Player, rng: &mut impl Rng) -> f32 {
+    fn rollout(&self, mut state: GameState, root_player: Player, rng: &mut impl Rng) -> f32 {
         let mut ply = 0u32;
         while !state.is_terminal() {
             if ply >= MAX_GAME_MOVES {
@@ -96,7 +96,7 @@ impl Mcts {
     ///
     /// Parallel workers each run from an empty tree on a clone of the root
     /// [`GameState`], then statistics are merged additively into this tree.
-    pub fn search_iters<P: RolloutPolicy>(&mut self, n: u32, rng: &mut impl Rng, rollout: &mut P) {
+    pub fn search_iters<P: RolloutPolicy>(&mut self, n: u32, rng: &mut impl Rng, rollout: &P) {
         let threads = rayon::current_num_threads().max(1);
         if n == 0 {
             return;
@@ -114,7 +114,7 @@ impl Mcts {
         &mut self,
         n: u32,
         rng: &mut impl Rng,
-        rollout: &mut P,
+        rollout: &P,
     ) {
         for _ in 0..n {
             let leaf = self.select(0);
@@ -144,8 +144,8 @@ impl Mcts {
             .map(|chunk| {
                 let mut m = Mcts::new(root_state.clone());
                 let mut rng = rand::thread_rng();
-                let mut rollout = RandomRollout;
-                m.search_iters_serial(chunk, &mut rng, &mut rollout);
+                let rollout = RandomRollout;
+                m.search_iters_serial(chunk, &mut rng, &rollout);
                 m
             })
             .collect();
@@ -264,7 +264,7 @@ impl Mcts {
         &mut self,
         iterations: u32,
         rng: &mut impl Rng,
-        rollout: &mut P,
+        rollout: &P,
     ) -> Vec<(Pos, f32, u32, f32)> {
         for _ in 0..iterations {
             let leaf = self.select(0);
@@ -355,7 +355,7 @@ impl Mcts {
         &self,
         id: usize,
         rng: &mut impl Rng,
-        rollout: &mut P,
+        rollout: &P,
     ) -> f32 {
         let state = self.nodes[id].state.clone();
         rollout.rollout(state, self.root_player, rng)
@@ -387,8 +387,8 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(42);
         let n = 100u32;
         let before = m.nodes[0].visits;
-        let mut rollout = RandomRollout;
-        m.search_iters(n, &mut rng, &mut rollout);
+        let rollout = RandomRollout;
+        m.search_iters(n, &mut rng, &rollout);
         assert_eq!(m.nodes[0].visits, before + n);
         assert_eq!(m.total_visits(), before + n);
     }
@@ -397,10 +397,10 @@ mod tests {
     fn parallel_merge_adds_onto_existing_root_visits() {
         let mut m = Mcts::new(GameState::new());
         let mut rng = StdRng::seed_from_u64(7);
-        let mut rollout = RandomRollout;
-        m.search_iters_serial(20, &mut rng, &mut rollout);
+        let rollout = RandomRollout;
+        m.search_iters_serial(20, &mut rng, &rollout);
         let before = m.nodes[0].visits;
-        m.search_iters(80, &mut rng, &mut rollout);
+        m.search_iters(80, &mut rng, &rollout);
         assert_eq!(m.nodes[0].visits, before + 80);
     }
 }

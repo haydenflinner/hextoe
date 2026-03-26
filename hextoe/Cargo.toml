@@ -34,5 +34,9 @@ criterion = { version = "0.5", features = ["html_reports"] }
 name = "mcts_bench"
 harness = false
 
+[[bench]]
+name = "train_bench"
+harness = false
+
 [profile.release]
 opt-level = 3

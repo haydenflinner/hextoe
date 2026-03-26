@@ -156,7 +156,10 @@ impl LoadedNet {
     }
 }
 
-/// Run one MCTS rollout using the network policy until terminal (used by [`NeuralRollout`]).
+/// Run one MCTS rollout using the network policy until terminal.
+///
+/// **Slow:** one full forward pass per ply until the game ends. Prefer
+/// [`neural_leaf_value_policy`] for MCTS (AlphaZero-style: single value eval at the leaf).
 pub fn neural_rollout_policy(
     net: &HextoeNet,
     device: &Device,
@@ -185,7 +188,7 @@ pub fn neural_rollout_policy(
                 }
             }
             Err(_) => {
-                let mut fallback = RandomRollout;
+                let fallback = RandomRollout;
                 return fallback.rollout(state, root_player, rng);
             }
         };
@@ -196,6 +199,38 @@ pub fn neural_rollout_policy(
         Some(p) if p == root_player => 1.0,
         Some(_) => -1.0,
         None => 0.0,
+    }
+}
+
+/// One forward pass at the leaf: value from the network, converted to `root_player`'s
+/// perspective (AlphaZero-style MCTS backup target).
+pub fn neural_leaf_value_policy(
+    net: &HextoeNet,
+    device: &Device,
+    state: GameState,
+    root_player: Player,
+    rng: &mut impl Rng,
+) -> f32 {
+    if state.is_terminal() {
+        return match state.winner {
+            Some(p) if p == root_player => 1.0,
+            Some(_) => -1.0,
+            None => 0.0,
+        };
+    }
+    match net.evaluate_state(&state, device) {
+        Ok((_, v)) => {
+            let cp = state.current_player();
+            if cp == root_player {
+                v
+            } else {
+                -v
+            }
+        }
+        Err(_) => {
+            let fallback = RandomRollout;
+            fallback.rollout(state, root_player, rng)
+        }
     }
 }
 
@@ -223,8 +258,8 @@ pub struct NeuralRollout<'a> {
 }
 
 impl RolloutPolicy for NeuralRollout<'_> {
-    fn rollout(&mut self, state: GameState, root_player: Player, rng: &mut impl Rng) -> f32 {
-        neural_rollout_policy(self.net, self.device, state, root_player, rng)
+    fn rollout(&self, state: GameState, root_player: Player, rng: &mut impl Rng) -> f32 {
+        neural_leaf_value_policy(self.net, self.device, state, root_player, rng)
     }
 
     const PARALLEL_SAFE: bool = false;
@@ -239,13 +274,13 @@ pub struct DualNetRollout<'a> {
 }
 
 impl RolloutPolicy for DualNetRollout<'_> {
-    fn rollout(&mut self, state: GameState, root_player: Player, rng: &mut impl Rng) -> f32 {
+    fn rollout(&self, state: GameState, root_player: Player, rng: &mut impl Rng) -> f32 {
         let net = if state.current_player() == self.new_player {
             self.new_net
         } else {
             self.best_net
         };
-        neural_rollout_policy(net, self.device, state, root_player, rng)
+        neural_leaf_value_policy(net, self.device, state, root_player, rng)
     }
 
     const PARALLEL_SAFE: bool = false;

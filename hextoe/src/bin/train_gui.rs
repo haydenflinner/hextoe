@@ -15,7 +15,7 @@ fn main() -> eframe::Result<()> {
         eprintln!(
             "hextoe-train-gui\n\n\
              Options:\n\
-               --random-rollout, -r   MCTS simulations use fast random playouts instead of the NN\n\
+               --random-rollout, -r   MCTS simulations use fast random playouts instead of NN leaf value\n\
                -h, --help             Show this help\n"
         );
         return Ok(());
@@ -31,7 +31,13 @@ fn main() -> eframe::Result<()> {
     let train_err: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let err_slot = train_err.clone();
     thread::spawn(move || {
-        let r = run_training(cfg_thread, Some(mon_thread), false, Some(cancel_thread));
+        let r = run_training(
+            cfg_thread,
+            Some(mon_thread),
+            false,
+            Some(cancel_thread),
+            false,
+        );
         if let Err(e) = r {
             if let Ok(mut g) = err_slot.lock() {
                 *g = Some(e.to_string());
@@ -117,6 +123,7 @@ impl eframe::App for TrainDashboard {
                     g.mean_loss,
                     g.last_checkpoint_msg.clone(),
                     g.last_promotion_msg.clone(),
+                    g.self_play_parallel_games,
                 )
             });
 
@@ -141,6 +148,7 @@ impl eframe::App for TrainDashboard {
                 mean_loss,
                 last_ck,
                 last_promo,
+                parallel_games,
             )) = snap
             {
                 ui.columns(2, |cols| {
@@ -175,6 +183,7 @@ impl eframe::App for TrainDashboard {
                         ui.label(format!("Self-play budget: {self_play_secs:.0}s / iter"));
                         ui.label(format!("Promotion eval: {promotion_eval_secs:.0}s"));
                         ui.label(format!("MCTS iters / move: {mcts_im}"));
+                        ui.label(format!("Parallel self-play games: {parallel_games}"));
                         ui.label(format!("Train steps / iter: {train_steps}"));
                         ui.label(format!("Batch size: {batch_size}"));
                         ui.label(format!(
@@ -182,7 +191,7 @@ impl eframe::App for TrainDashboard {
                             if use_random_rollout {
                                 "random rollout (fast)"
                             } else {
-                                "NN policy rollout"
+                                "NN value at leaf"
                             }
                         ));
                         ui.separator();

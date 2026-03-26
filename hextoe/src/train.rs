@@ -6,17 +6,18 @@ use std::collections::VecDeque;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rand::SeedableRng;
+use rayon::prelude::*;
 
 use crate::encode::{CHANNELS, GRID};
 use crate::game::Player;
 use crate::mcts::{RandomRollout, RolloutPolicy};
 use crate::nn::{load_weights, save_weights, HextoeNet, LoadedNet, NeuralRollout};
-use crate::self_play::{ReplayBuffer, SelfPlayCollector};
+use crate::self_play::{GameRecord, ReplayBuffer, SelfPlayCollector};
 
 const LOG_CAP: usize = 400;
 
@@ -42,6 +43,8 @@ pub const DEFAULT_BATCH_SIZE: usize = 128;
 pub const DEFAULT_LR: f64 = 3e-4;
 pub const DEFAULT_WEIGHT_DECAY: f64 = 1e-4;
 pub const DEFAULT_SELF_PLAY_PROGRESS_EVERY_N_MOVES: u32 = 1;
+/// Concurrent self-play games per batch (`0` = use [`rayon::current_num_threads`]).
+pub const DEFAULT_SELF_PLAY_PARALLEL_GAMES: usize = 0;
 
 /// Hyperparameters for the training loop.
 #[derive(Clone, Debug)]
@@ -62,8 +65,10 @@ pub struct TrainingConfig {
     pub weight_decay: f64,
     pub self_play_progress_every_n_moves: u32,
     pub device: Device,
-    /// If true, MCTS simulations use fast uniform random playouts instead of the NN policy.
+    /// If true, MCTS simulations use fast uniform random playouts instead of NN value at the leaf.
     pub use_random_rollout: bool,
+    /// How many games to run in parallel during each self-play batch (`0` = Rayon thread count).
+    pub self_play_parallel_games: usize,
 }
 
 impl Default for TrainingConfig {
@@ -91,6 +96,7 @@ impl TrainingConfig {
             self_play_progress_every_n_moves: DEFAULT_SELF_PLAY_PROGRESS_EVERY_N_MOVES,
             device: Device::Cpu,
             use_random_rollout,
+            self_play_parallel_games: DEFAULT_SELF_PLAY_PARALLEL_GAMES,
         }
     }
 
@@ -103,6 +109,19 @@ impl TrainingConfig {
 /// True if argv contains `--random-rollout` or `-r` (for `hextoe-train` / `hextoe-train-gui`).
 pub fn cli_use_random_rollout() -> bool {
     std::env::args().skip(1).any(|a| a == "--random-rollout" || a == "-r")
+}
+
+/// True if argv contains `--one-checkpoint` (for `hextoe-train` profiling runs).
+pub fn cli_one_checkpoint() -> bool {
+    std::env::args().skip(1).any(|a| a == "--one-checkpoint")
+}
+
+/// Effective number of concurrent self-play games (`0` in config → Rayon thread count).
+pub fn parallel_game_count(config: &TrainingConfig) -> usize {
+    match config.self_play_parallel_games {
+        0 => rayon::current_num_threads().max(1),
+        n => n.max(1),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -138,6 +157,7 @@ pub struct TrainingMonitor {
     pub last_promotion_msg: Option<String>,
     /// MCTS uses [`RandomRollout`] when true, [`NeuralRollout`] when false.
     pub use_random_rollout: bool,
+    pub self_play_parallel_games: usize,
     pub log: VecDeque<String>,
 }
 
@@ -164,6 +184,7 @@ impl TrainingMonitor {
             last_checkpoint_msg: None,
             last_promotion_msg: None,
             use_random_rollout: config.use_random_rollout,
+            self_play_parallel_games: parallel_game_count(config),
             log: VecDeque::with_capacity(LOG_CAP.min(32)),
         }
     }
@@ -193,12 +214,15 @@ fn log_line(
     }
 }
 
-/// Play full games until `self_play_secs` wall time has elapsed (no new game starts after the budget).
-fn self_play_until_duration<P: RolloutPolicy>(
+/// Play full games until `self_play_secs` wall time has elapsed (no new batch starts after the budget).
+///
+/// When [`TrainingConfig::self_play_parallel_games`] resolves to more than one, each batch runs that
+/// many games on Rayon (shared read-only `rollout`; each game uses its own RNG).
+pub fn self_play_until_duration<P: RolloutPolicy + Send + Sync>(
     collector: &SelfPlayCollector,
     config: &TrainingConfig,
     rng: &mut rand::rngs::StdRng,
-    rollout: &mut P,
+    rollout: &P,
     monitor: &Option<Arc<Mutex<TrainingMonitor>>>,
     log_stdout: bool,
     cancel: &Option<Arc<AtomicBool>>,
@@ -206,68 +230,160 @@ fn self_play_until_duration<P: RolloutPolicy>(
 ) -> (usize, Vec<f64>, usize) {
     let budget = Duration::from_secs_f64(config.self_play_secs.max(0.0));
     let phase_start = Instant::now();
+    let deadline = phase_start + budget;
+    let parallel = parallel_game_count(config);
+
+    if parallel <= 1 {
+        let mut new_records = 0usize;
+        let mut game_secs: Vec<f64> = Vec::new();
+        let mut game_i = 0usize;
+
+        while phase_start.elapsed() < budget {
+            if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
+                break;
+            }
+
+            game_i += 1;
+            let t0 = Instant::now();
+            let n_prog = config.self_play_progress_every_n_moves;
+            let records = collector.play_game_with_progress(
+                config.mcts_iters_per_move,
+                rng,
+                rollout,
+                |move_idx, mcts_dt| {
+                    if let Some(m) = monitor {
+                        if let Ok(mut g) = m.lock() {
+                            g.current_game = game_i;
+                            g.current_move = move_idx;
+                            g.last_mcts_secs = mcts_dt.as_secs_f64();
+                        }
+                    }
+                    if n_prog > 1 && (move_idx - 1) % n_prog != 0 {
+                        return;
+                    }
+                    log_line(
+                        monitor,
+                        log_stdout,
+                        &format!(
+                            "    game {}  move {:4}  mcts {:6.2}s",
+                            game_i,
+                            move_idx,
+                            mcts_dt.as_secs_f64()
+                        ),
+                    );
+                },
+            );
+            let secs = t0.elapsed().as_secs_f64();
+            game_secs.push(secs);
+            let positions = records.len();
+            new_records += positions;
+            for r in records {
+                buffer.push(r);
+            }
+            if let Some(m) = monitor {
+                if let Ok(mut g) = m.lock() {
+                    g.buffer_len = buffer.len();
+                }
+            }
+            log_line(
+                monitor,
+                log_stdout,
+                &format!(
+                    "  game {} done: {:.2}s ({} positions)",
+                    game_i, secs, positions
+                ),
+            );
+        }
+
+        return (new_records, game_secs, game_i);
+    }
+
+    let game_counter = AtomicUsize::new(0);
     let mut new_records = 0usize;
     let mut game_secs: Vec<f64> = Vec::new();
-    let mut game_i = 0usize;
 
-    while phase_start.elapsed() < budget {
+    loop {
         if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
             break;
         }
+        if phase_start.elapsed() >= budget {
+            break;
+        }
 
-        game_i += 1;
-        let t0 = Instant::now();
-        let n_prog = config.self_play_progress_every_n_moves;
-        let records = collector.play_game_with_progress(
-            config.mcts_iters_per_move,
-            rng,
-            rollout,
-            |move_idx, mcts_dt| {
-                if let Some(m) = monitor {
-                    if let Ok(mut g) = m.lock() {
-                        g.current_game = game_i;
-                        g.current_move = move_idx;
-                        g.last_mcts_secs = mcts_dt.as_secs_f64();
-                    }
+        let batch: Vec<(f64, usize, Vec<GameRecord>, usize)> = (0..parallel)
+            .into_par_iter()
+            .filter_map(|_| {
+                if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
+                    return None;
                 }
-                if n_prog > 1 && (move_idx - 1) % n_prog != 0 {
-                    return;
+                if Instant::now() >= deadline {
+                    return None;
                 }
-                log_line(
-                    monitor,
-                    log_stdout,
-                    &format!(
-                        "    game {}  move {:4}  mcts {:6.2}s",
-                        game_i,
-                        move_idx,
-                        mcts_dt.as_secs_f64()
-                    ),
+                let game_i = game_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                let mut thread_rng = rand::thread_rng();
+                let t0 = Instant::now();
+                let n_prog = config.self_play_progress_every_n_moves;
+                let records = collector.play_game_with_progress(
+                    config.mcts_iters_per_move,
+                    &mut thread_rng,
+                    rollout,
+                    |move_idx, mcts_dt| {
+                        if let Some(m) = monitor {
+                            if let Ok(mut g) = m.lock() {
+                                g.current_game = game_i;
+                                g.current_move = move_idx;
+                                g.last_mcts_secs = mcts_dt.as_secs_f64();
+                            }
+                        }
+                        if n_prog > 1 && (move_idx - 1) % n_prog != 0 {
+                            return;
+                        }
+                        log_line(
+                            monitor,
+                            log_stdout,
+                            &format!(
+                                "    game {}  move {:4}  mcts {:6.2}s",
+                                game_i,
+                                move_idx,
+                                mcts_dt.as_secs_f64()
+                            ),
+                        );
+                    },
                 );
-            },
-        );
-        let secs = t0.elapsed().as_secs_f64();
-        game_secs.push(secs);
-        let positions = records.len();
-        new_records += positions;
-        for r in records {
-            buffer.push(r);
+                let secs = t0.elapsed().as_secs_f64();
+                let positions = records.len();
+                Some((secs, positions, records, game_i))
+            })
+            .collect();
+
+        if batch.is_empty() {
+            break;
         }
-        if let Some(m) = monitor {
-            if let Ok(mut g) = m.lock() {
-                g.buffer_len = buffer.len();
+
+        for (secs, positions, records, gid) in batch {
+            game_secs.push(secs);
+            new_records += positions;
+            for r in records {
+                buffer.push(r);
             }
+            if let Some(m) = monitor {
+                if let Ok(mut g) = m.lock() {
+                    g.buffer_len = buffer.len();
+                }
+            }
+            log_line(
+                monitor,
+                log_stdout,
+                &format!(
+                    "  game {gid} done: {:.2}s ({} positions)",
+                    secs, positions
+                ),
+            );
         }
-        log_line(
-            monitor,
-            log_stdout,
-            &format!(
-                "  game {} done: {:.2}s ({} positions)",
-                game_i, secs, positions
-            ),
-        );
     }
 
-    (new_records, game_secs, game_i)
+    let games_played = game_counter.load(Ordering::Relaxed);
+    (new_records, game_secs, games_played)
 }
 
 fn resolve_initial_checkpoint_path<'a>(
@@ -356,11 +472,15 @@ fn io_to_candle(e: std::io::Error) -> candle_core::Error {
 }
 
 /// Run the training loop until [`cancel`] is set (if provided) or forever.
+///
+/// If `stop_after_first_checkpoint` is true, exits right after the first successful write to
+/// [`TrainingConfig::latest_path`] (skips promotion eval). Useful with `cargo flamegraph`.
 pub fn run_training(
     config: TrainingConfig,
     monitor: Option<Arc<Mutex<TrainingMonitor>>>,
     log_stdout: bool,
     cancel: Option<Arc<AtomicBool>>,
+    stop_after_first_checkpoint: bool,
 ) -> candle_core::Result<()> {
     let device = config.device.clone();
 
@@ -399,18 +519,20 @@ pub fn run_training(
     let mut buffer = ReplayBuffer::new(config.replay_capacity);
     let collector = SelfPlayCollector::new();
     let mut rng = rand::rngs::StdRng::from_entropy();
+    let mut one_checkpoint_buffer_hinted = false;
 
     let rollout_note = if config.use_random_rollout {
         "random playouts"
     } else {
-        "NN policy rollouts"
+        "NN leaf value"
     };
     log_line(
         &monitor,
         log_stdout,
         &format!(
-            "Training loop (~{:.0}s self-play / iter, {} MCTS iters/move, {rollout_note}). latest={} best={}",
+            "Training loop (~{:.0}s self-play / iter, {} parallel games, {} MCTS iters/move, {rollout_note}). latest={} best={}",
             config.self_play_secs,
+            parallel_game_count(&config),
             config.mcts_iters_per_move,
             config.latest_path,
             config.best_path,
@@ -431,39 +553,41 @@ pub fn run_training(
                 g.iteration = iteration;
                 g.phase = TrainPhase::SelfPlay;
                 g.buffer_len = buffer.len();
+                g.self_play_parallel_games = parallel_game_count(&config);
             }
         }
 
         let sp_rollout_note = if config.use_random_rollout {
             "random playouts"
         } else {
-            "NN policy rollouts"
+            "NN leaf value"
         };
         log_line(
             &monitor,
             log_stdout,
             &format!(
-                "[iter {iteration}] self-play ({sp_rollout_note}): {:.0}s budget × {} MCTS iters/move — starting…",
+                "[iter {iteration}] self-play ({sp_rollout_note}): {:.0}s budget × {} parallel × {} MCTS iters/move — starting…",
                 config.self_play_secs,
+                parallel_game_count(&config),
                 config.mcts_iters_per_move
             ),
         );
 
         let sp_phase = Instant::now();
         let (new_records, game_secs, games_played) = if config.use_random_rollout {
-            let mut rollout = RandomRollout;
+            let rollout = RandomRollout;
             self_play_until_duration(
                 &collector,
                 &config,
                 &mut rng,
-                &mut rollout,
+                &rollout,
                 &monitor,
                 log_stdout,
                 &cancel,
                 &mut buffer,
             )
         } else {
-            let mut rollout = NeuralRollout {
+            let rollout = NeuralRollout {
                 net: &model,
                 device: &device,
             };
@@ -471,7 +595,7 @@ pub fn run_training(
                 &collector,
                 &config,
                 &mut rng,
-                &mut rollout,
+                &rollout,
                 &monitor,
                 log_stdout,
                 &cancel,
@@ -518,6 +642,14 @@ pub fn run_training(
                 log_stdout,
                 "  (buffer too small, skipping training)",
             );
+            if stop_after_first_checkpoint && !one_checkpoint_buffer_hinted {
+                one_checkpoint_buffer_hinted = true;
+                log_line(
+                    &monitor,
+                    log_stdout,
+                    "  --one-checkpoint: no checkpoint written yet; lower min_buffer_for_training or collect more self-play first.",
+                );
+            }
             continue;
         }
 
@@ -555,6 +687,15 @@ pub fn run_training(
             if let Ok(mut g) = m.lock() {
                 g.last_checkpoint_msg = Some(ck_msg);
             }
+        }
+
+        if stop_after_first_checkpoint {
+            log_line(
+                &monitor,
+                log_stdout,
+                "  Stopping after first checkpoint (--one-checkpoint).",
+            );
+            break;
         }
 
         // Promotion gate: keep `best` unless the new net fails the eval (NN mode only).

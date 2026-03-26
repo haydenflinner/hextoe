@@ -102,7 +102,7 @@ impl SelfPlayCollector {
         &self,
         mcts_iters: u32,
         rng: &mut R,
-        rollout: &mut P,
+        rollout: &P,
     ) -> Vec<GameRecord> {
         self.play_game_with_progress(mcts_iters, rng, rollout, |_, _| {})
     }
@@ -113,7 +113,7 @@ impl SelfPlayCollector {
         &self,
         mcts_iters: u32,
         rng: &mut R,
-        rollout: &mut P,
+        rollout: &P,
         mut on_mcts: F,
     ) -> Vec<GameRecord>
     where
@@ -217,7 +217,7 @@ impl SelfPlayCollector {
     ) -> Option<Player> {
         let mut state = GameState::new();
         let mut move_count = 0u32;
-        let mut dual = DualNetRollout {
+        let dual = DualNetRollout {
             new_net,
             best_net,
             new_player,
@@ -233,7 +233,7 @@ impl SelfPlayCollector {
             }
 
             let mut mcts = Mcts::new(state.clone());
-            mcts.search_iters(mcts_iters, rng, &mut dual);
+            mcts.search_iters(mcts_iters, rng, &dual);
 
             let children_stats: Vec<(Pos, u32)> = mcts.root_children_stats();
             let total_visits: u32 = children_stats.iter().map(|(_, v)| v).sum();
