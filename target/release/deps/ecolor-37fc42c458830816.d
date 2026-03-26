@@ -1,0 +1,12 @@
+/Users/wow/code/hextoe/target/release/deps/ecolor-37fc42c458830816.d: /Users/wow/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.28.1/src/lib.rs /Users/wow/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.28.1/src/color32.rs /Users/wow/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.28.1/src/hsva_gamma.rs /Users/wow/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.28.1/src/hsva.rs /Users/wow/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.28.1/src/rgba.rs /Users/wow/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.28.1/src/hex_color_runtime.rs
+
+/Users/wow/code/hextoe/target/release/deps/libecolor-37fc42c458830816.rlib: /Users/wow/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.28.1/src/lib.rs /Users/wow/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.28.1/src/color32.rs /Users/wow/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.28.1/src/hsva_gamma.rs /Users/wow/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.28.1/src/hsva.rs /Users/wow/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.28.1/src/rgba.rs /Users/wow/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.28.1/src/hex_color_runtime.rs
+
+/Users/wow/code/hextoe/target/release/deps/libecolor-37fc42c458830816.rmeta: /Users/wow/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.28.1/src/lib.rs /Users/wow/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.28.1/src/color32.rs /Users/wow/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.28.1/src/hsva_gamma.rs /Users/wow/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.28.1/src/hsva.rs /Users/wow/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.28.1/src/rgba.rs /Users/wow/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.28.1/src/hex_color_runtime.rs
+
+/Users/wow/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.28.1/src/lib.rs:
+/Users/wow/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.28.1/src/color32.rs:
+/Users/wow/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.28.1/src/hsva_gamma.rs:
+/Users/wow/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.28.1/src/hsva.rs:
+/Users/wow/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.28.1/src/rgba.rs:
+/Users/wow/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.28.1/src/hex_color_runtime.rs:

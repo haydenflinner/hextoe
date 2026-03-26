@@ -1,0 +1,16 @@
+[package]
+name = "hextoe"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "hextoe"
+path = "src/main.rs"
+
+[dependencies]
+eframe = "0.28"
+egui = "0.28"
+rand = "0.8"
+
+[profile.release]
+opt-level = 3
