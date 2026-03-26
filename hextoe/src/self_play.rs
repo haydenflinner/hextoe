@@ -1,9 +1,12 @@
 use rand::Rng;
 use std::time::{Duration, Instant};
 
+use candle_core::Device;
+
 use crate::encode::{action_to_index, board_center, encode_state, CHANNELS, GRID};
 use crate::game::{GameState, Player, Pos};
 use crate::mcts::{Mcts, RolloutPolicy, MAX_GAME_MOVES};
+use crate::nn::{DualNetRollout, HextoeNet};
 
 // ── Data structures ───────────────────────────────────────────────────────────
 
@@ -199,6 +202,64 @@ impl SelfPlayCollector {
                 }
             })
             .collect()
+    }
+
+    /// One full game between two networks (MCTS + neural rollouts). `new_player` is which
+    /// side uses `new_net`; the other uses `best_net`. Returns the winner, if any.
+    pub fn play_match_game<R: Rng>(
+        &self,
+        mcts_iters: u32,
+        rng: &mut R,
+        new_net: &HextoeNet,
+        best_net: &HextoeNet,
+        new_player: Player,
+        device: &Device,
+    ) -> Option<Player> {
+        let mut state = GameState::new();
+        let mut move_count = 0u32;
+        let mut dual = DualNetRollout {
+            new_net,
+            best_net,
+            new_player,
+            device,
+        };
+
+        loop {
+            if state.is_terminal() {
+                break;
+            }
+            if move_count >= MAX_GAME_MOVES {
+                break;
+            }
+
+            let mut mcts = Mcts::new(state.clone());
+            mcts.search_iters(mcts_iters, rng, &mut dual);
+
+            let children_stats: Vec<(Pos, u32)> = mcts.root_children_stats();
+            let total_visits: u32 = children_stats.iter().map(|(_, v)| v).sum();
+
+            let chosen_pos = if total_visits == 0 {
+                let actions = state.legal_actions();
+                actions[rng.gen_range(0..actions.len())]
+            } else {
+                let threshold = rng.gen::<f32>() * total_visits as f32;
+                let mut cumulative = 0.0f32;
+                let mut chosen = children_stats[0].0;
+                for &(pos, visits) in &children_stats {
+                    cumulative += visits as f32;
+                    if cumulative >= threshold {
+                        chosen = pos;
+                        break;
+                    }
+                }
+                chosen
+            };
+
+            state.place(chosen_pos);
+            move_count += 1;
+        }
+
+        state.winner
     }
 }
 

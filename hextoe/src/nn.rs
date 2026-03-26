@@ -230,6 +230,27 @@ impl RolloutPolicy for NeuralRollout<'_> {
     const PARALLEL_SAFE: bool = false;
 }
 
+/// MCTS rollout policy for new-vs-best evaluation: the player to move uses their own net.
+pub struct DualNetRollout<'a> {
+    pub new_net: &'a HextoeNet,
+    pub best_net: &'a HextoeNet,
+    pub new_player: Player,
+    pub device: &'a Device,
+}
+
+impl RolloutPolicy for DualNetRollout<'_> {
+    fn rollout(&mut self, state: GameState, root_player: Player, rng: &mut impl Rng) -> f32 {
+        let net = if state.current_player() == self.new_player {
+            self.new_net
+        } else {
+            self.best_net
+        };
+        neural_rollout_policy(net, self.device, state, root_player, rng)
+    }
+
+    const PARALLEL_SAFE: bool = false;
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Initialise a fresh model with random weights on `device`.

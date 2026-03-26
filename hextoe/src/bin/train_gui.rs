@@ -102,7 +102,9 @@ impl eframe::App for TrainDashboard {
                     g.buffer_len,
                     g.buffer_capacity,
                     g.min_buffer_for_training,
-                    g.games_per_iter,
+                    g.self_play_secs,
+                    g.promotion_eval_secs,
+                    g.games_this_iter,
                     g.mcts_iters_per_move,
                     g.train_steps,
                     g.batch_size,
@@ -114,6 +116,7 @@ impl eframe::App for TrainDashboard {
                     g.last_iteration_new_records,
                     g.mean_loss,
                     g.last_checkpoint_msg.clone(),
+                    g.last_promotion_msg.clone(),
                 )
             });
 
@@ -123,7 +126,9 @@ impl eframe::App for TrainDashboard {
                 buffer_len,
                 buffer_cap,
                 min_buf,
-                games_per_iter,
+                self_play_secs,
+                promotion_eval_secs,
+                games_this_iter,
                 mcts_im,
                 train_steps,
                 batch_size,
@@ -135,6 +140,7 @@ impl eframe::App for TrainDashboard {
                 new_recs,
                 mean_loss,
                 last_ck,
+                last_promo,
             )) = snap
             {
                 ui.columns(2, |cols| {
@@ -149,6 +155,7 @@ impl eframe::App for TrainDashboard {
                                 TrainPhase::SelfPlay => "self-play",
                                 TrainPhase::Training => "gradient steps",
                                 TrainPhase::SavingCheckpoint => "saving weights",
+                                TrainPhase::PromotionEval => "promotion eval (new vs best)",
                             }
                         ));
                         ui.separator();
@@ -165,7 +172,8 @@ impl eframe::App for TrainDashboard {
                         );
                         ui.separator();
                         ui.heading("Hyperparameters");
-                        ui.label(format!("Games / iter: {games_per_iter}"));
+                        ui.label(format!("Self-play budget: {self_play_secs:.0}s / iter"));
+                        ui.label(format!("Promotion eval: {promotion_eval_secs:.0}s"));
                         ui.label(format!("MCTS iters / move: {mcts_im}"));
                         ui.label(format!("Train steps / iter: {train_steps}"));
                         ui.label(format!("Batch size: {batch_size}"));
@@ -179,7 +187,7 @@ impl eframe::App for TrainDashboard {
                         ));
                         ui.separator();
                         ui.heading("Current self-play");
-                        ui.label(format!("Game {cur_game} (of {games_per_iter} this iter)"));
+                        ui.label(format!("Game {cur_game} (last iter: {games_this_iter} games)"));
                         ui.label(format!("Move {cur_move}"));
                         ui.label(format!("Last MCTS block: {last_mcts:.2}s"));
                         ui.separator();
@@ -191,6 +199,9 @@ impl eframe::App for TrainDashboard {
                         }
                         if let Some(ref m) = last_ck {
                             ui.label(egui::RichText::new(m).strong());
+                        }
+                        if let Some(ref m) = last_promo {
+                            ui.label(egui::RichText::new(m).weak());
                         }
                     });
 

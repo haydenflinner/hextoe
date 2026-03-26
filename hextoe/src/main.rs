@@ -2,6 +2,7 @@ use candle_core::Device;
 use hextoe::game::{winning_line, GameState, Player, Pos};
 use hextoe::mcts::{Mcts, RandomRollout};
 use hextoe::nn::{LoadedNet, NeuralRollout};
+use hextoe::train::default_inference_checkpoint_path;
 
 use eframe::egui;
 use egui::{Color32, FontId, Pos2, RichText, Stroke};
@@ -13,9 +14,6 @@ use std::thread;
 const HEX_SIZE: f32 = 32.0;
 /// Iterations per batch sent by the background thread.
 const BATCH_SIZE: u32 = 300;
-/// Same default filename as `hextoe-train` writes (`cargo run --bin hextoe-train` from crate dir).
-const MODEL_PATH: &str = "hextoe_model.safetensors";
-
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -34,7 +32,7 @@ fn main() -> eframe::Result<()> {
 
 struct App {
     game: GameState,
-    /// `hextoe_model.safetensors` is present (UI hint; each MCTS thread loads its own copy).
+    /// A training checkpoint exists (latest / best / legacy); each MCTS thread loads its own copy.
     nn_checkpoint_hint: bool,
     /// Current best suggestions: (pos, win_rate, visits, policy_share).
     suggestions: Vec<(Pos, f32, u32, f32)>,
@@ -50,7 +48,7 @@ struct App {
 
 impl App {
     fn new() -> Self {
-        let nn_checkpoint_hint = std::path::Path::new(MODEL_PATH).exists();
+        let nn_checkpoint_hint = default_inference_checkpoint_path().is_some();
         let mut app = App {
             game: GameState::new(),
             nn_checkpoint_hint,
@@ -85,7 +83,8 @@ impl App {
 
         thread::spawn(move || {
             let device = Device::Cpu;
-            let loaded_nn = LoadedNet::try_load(MODEL_PATH, &device).ok();
+            let loaded_nn = default_inference_checkpoint_path()
+                .and_then(|p| LoadedNet::try_load(p, &device).ok());
             let mut rng = rand::thread_rng();
             let mut mcts = Mcts::new(game);
             loop {
@@ -315,9 +314,9 @@ impl eframe::App for App {
                         ui.add_space(4.0);
                     } else {
                         ui.label(
-                            RichText::new(format!(
-                                "No {MODEL_PATH} — random rollouts"
-                            ))
+                            RichText::new(
+                                "No checkpoint (latest / best / legacy) — random rollouts",
+                            )
                             .size(11.0)
                             .color(Color32::from_rgb(200, 160, 90)),
                         );

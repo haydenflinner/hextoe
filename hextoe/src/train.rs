@@ -3,27 +3,39 @@
 use candle_core::{Device, DType, Tensor};
 use candle_nn::{optim::AdamW, optim::ParamsAdamW, Optimizer, VarBuilder, VarMap};
 use std::collections::VecDeque;
+use std::fs;
 use std::io::Write;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rand::SeedableRng;
 
 use crate::encode::{CHANNELS, GRID};
+use crate::game::Player;
 use crate::mcts::{RandomRollout, RolloutPolicy};
-use crate::nn::{load_weights, save_weights, HextoeNet, NeuralRollout};
+use crate::nn::{load_weights, save_weights, HextoeNet, LoadedNet, NeuralRollout};
 use crate::self_play::{ReplayBuffer, SelfPlayCollector};
 
 const LOG_CAP: usize = 400;
 
 // ── Default hyperparameters (single source of truth for hextoe-train / hextoe-train-gui) ──
 
-/// Checkpoint path when running from the crate / workspace directory.
-pub const DEFAULT_MODEL_PATH: &str = "hextoe_model.safetensors";
+/// Weights after each training step (always overwritten).
+pub const DEFAULT_LATEST_PATH: &str = "hextoe_model_latest.safetensors";
+/// Champion weights used as the promotion gate opponent.
+pub const DEFAULT_BEST_PATH: &str = "hextoe_model_best.safetensors";
+/// Legacy single-file checkpoint (loaded if latest/best are missing).
+pub const DEFAULT_LEGACY_MODEL_PATH: &str = "hextoe_model.safetensors";
 pub const DEFAULT_REPLAY_CAPACITY: usize = 50_000;
 pub const DEFAULT_MIN_BUFFER_FOR_TRAINING: usize = 500;
-pub const DEFAULT_GAMES_PER_ITER: usize = 10;
+/// Wall-clock budget for self-play before each training step.
+pub const DEFAULT_SELF_PLAY_SECS: f64 = 30.0;
+/// Wall-clock budget for new-vs-best games after training (NN mode only).
+pub const DEFAULT_PROMOTION_EVAL_SECS: f64 = 15.0;
+/// Promote `latest` → `best` if new wins at least this fraction of eval games (no draws counted in denominator).
+pub const DEFAULT_PROMOTION_MIN_WIN_RATE: f64 = 0.52;
 pub const DEFAULT_MCTS_ITERS_PER_MOVE: u32 = 200;
 pub const DEFAULT_TRAIN_STEPS: usize = 5;
 pub const DEFAULT_BATCH_SIZE: usize = 128;
@@ -34,10 +46,15 @@ pub const DEFAULT_SELF_PLAY_PROGRESS_EVERY_N_MOVES: u32 = 1;
 /// Hyperparameters for the training loop.
 #[derive(Clone, Debug)]
 pub struct TrainingConfig {
-    pub model_path: String,
+    pub latest_path: String,
+    pub best_path: String,
     pub replay_capacity: usize,
     pub min_buffer_for_training: usize,
-    pub games_per_iter: usize,
+    /// Seconds of wall-clock self-play per iteration before training.
+    pub self_play_secs: f64,
+    /// Seconds of new-vs-best games for the promotion gate (after each training step).
+    pub promotion_eval_secs: f64,
+    pub promotion_min_win_rate: f64,
     pub mcts_iters_per_move: u32,
     pub train_steps: usize,
     pub batch_size: usize,
@@ -59,10 +76,13 @@ impl TrainingConfig {
     /// Build from [`DEFAULT_*`] constants; `use_random_rollout` is passed explicitly.
     pub fn from_defaults(use_random_rollout: bool) -> Self {
         Self {
-            model_path: DEFAULT_MODEL_PATH.to_string(),
+            latest_path: DEFAULT_LATEST_PATH.to_string(),
+            best_path: DEFAULT_BEST_PATH.to_string(),
             replay_capacity: DEFAULT_REPLAY_CAPACITY,
             min_buffer_for_training: DEFAULT_MIN_BUFFER_FOR_TRAINING,
-            games_per_iter: DEFAULT_GAMES_PER_ITER,
+            self_play_secs: DEFAULT_SELF_PLAY_SECS,
+            promotion_eval_secs: DEFAULT_PROMOTION_EVAL_SECS,
+            promotion_min_win_rate: DEFAULT_PROMOTION_MIN_WIN_RATE,
             mcts_iters_per_move: DEFAULT_MCTS_ITERS_PER_MOVE,
             train_steps: DEFAULT_TRAIN_STEPS,
             batch_size: DEFAULT_BATCH_SIZE,
@@ -91,6 +111,7 @@ pub enum TrainPhase {
     SelfPlay,
     Training,
     SavingCheckpoint,
+    PromotionEval,
 }
 
 /// Live snapshot for UIs (`Arc<Mutex<TrainingMonitor>>`).
@@ -101,7 +122,9 @@ pub struct TrainingMonitor {
     pub buffer_len: usize,
     pub buffer_capacity: usize,
     pub min_buffer_for_training: usize,
-    pub games_per_iter: usize,
+    pub self_play_secs: f64,
+    pub promotion_eval_secs: f64,
+    pub games_this_iter: usize,
     pub mcts_iters_per_move: u32,
     pub train_steps: usize,
     pub batch_size: usize,
@@ -112,6 +135,7 @@ pub struct TrainingMonitor {
     pub last_iteration_new_records: usize,
     pub mean_loss: Option<f32>,
     pub last_checkpoint_msg: Option<String>,
+    pub last_promotion_msg: Option<String>,
     /// MCTS uses [`RandomRollout`] when true, [`NeuralRollout`] when false.
     pub use_random_rollout: bool,
     pub log: VecDeque<String>,
@@ -125,7 +149,9 @@ impl TrainingMonitor {
             buffer_len: 0,
             buffer_capacity: config.replay_capacity,
             min_buffer_for_training: config.min_buffer_for_training,
-            games_per_iter: config.games_per_iter,
+            self_play_secs: config.self_play_secs,
+            promotion_eval_secs: config.promotion_eval_secs,
+            games_this_iter: 0,
             mcts_iters_per_move: config.mcts_iters_per_move,
             train_steps: config.train_steps,
             batch_size: config.batch_size,
@@ -136,6 +162,7 @@ impl TrainingMonitor {
             last_iteration_new_records: 0,
             mean_loss: None,
             last_checkpoint_msg: None,
+            last_promotion_msg: None,
             use_random_rollout: config.use_random_rollout,
             log: VecDeque::with_capacity(LOG_CAP.min(32)),
         }
@@ -166,7 +193,8 @@ fn log_line(
     }
 }
 
-fn self_play_iteration_batch<P: RolloutPolicy>(
+/// Play full games until `self_play_secs` wall time has elapsed (no new game starts after the budget).
+fn self_play_until_duration<P: RolloutPolicy>(
     collector: &SelfPlayCollector,
     config: &TrainingConfig,
     rng: &mut rand::rngs::StdRng,
@@ -175,16 +203,20 @@ fn self_play_iteration_batch<P: RolloutPolicy>(
     log_stdout: bool,
     cancel: &Option<Arc<AtomicBool>>,
     buffer: &mut ReplayBuffer,
-) -> (usize, Vec<f64>) {
+) -> (usize, Vec<f64>, usize) {
+    let budget = Duration::from_secs_f64(config.self_play_secs.max(0.0));
+    let phase_start = Instant::now();
     let mut new_records = 0usize;
-    let mut game_secs: Vec<f64> = Vec::with_capacity(config.games_per_iter);
-    for game_i in 0..config.games_per_iter {
+    let mut game_secs: Vec<f64> = Vec::new();
+    let mut game_i = 0usize;
+
+    while phase_start.elapsed() < budget {
         if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
             break;
         }
 
+        game_i += 1;
         let t0 = Instant::now();
-        let gi = game_i + 1;
         let n_prog = config.self_play_progress_every_n_moves;
         let records = collector.play_game_with_progress(
             config.mcts_iters_per_move,
@@ -193,7 +225,7 @@ fn self_play_iteration_batch<P: RolloutPolicy>(
             |move_idx, mcts_dt| {
                 if let Some(m) = monitor {
                     if let Ok(mut g) = m.lock() {
-                        g.current_game = gi;
+                        g.current_game = game_i;
                         g.current_move = move_idx;
                         g.last_mcts_secs = mcts_dt.as_secs_f64();
                     }
@@ -205,9 +237,8 @@ fn self_play_iteration_batch<P: RolloutPolicy>(
                     monitor,
                     log_stdout,
                     &format!(
-                        "    game {}/{}  move {:4}  mcts {:6.2}s",
-                        gi,
-                        config.games_per_iter,
+                        "    game {}  move {:4}  mcts {:6.2}s",
+                        game_i,
                         move_idx,
                         mcts_dt.as_secs_f64()
                     ),
@@ -230,12 +261,98 @@ fn self_play_iteration_batch<P: RolloutPolicy>(
             monitor,
             log_stdout,
             &format!(
-                "  game {}/{} done: {:.2}s ({} positions)",
-                gi, config.games_per_iter, secs, positions
+                "  game {} done: {:.2}s ({} positions)",
+                game_i, secs, positions
             ),
         );
     }
-    (new_records, game_secs)
+
+    (new_records, game_secs, game_i)
+}
+
+fn resolve_initial_checkpoint_path<'a>(
+    latest: &'a str,
+    best: &'a str,
+    legacy: &'a str,
+) -> Option<&'a str> {
+    if Path::new(latest).is_file() {
+        Some(latest)
+    } else if Path::new(best).is_file() {
+        Some(best)
+    } else if Path::new(legacy).is_file() {
+        Some(legacy)
+    } else {
+        None
+    }
+}
+
+/// Prefer [`DEFAULT_LATEST_PATH`], then [`DEFAULT_BEST_PATH`], then [`DEFAULT_LEGACY_MODEL_PATH`].
+/// Use this from the play UI so it loads the same weights as training when present.
+pub fn default_inference_checkpoint_path() -> Option<&'static str> {
+    resolve_initial_checkpoint_path(
+        DEFAULT_LATEST_PATH,
+        DEFAULT_BEST_PATH,
+        DEFAULT_LEGACY_MODEL_PATH,
+    )
+}
+
+/// Run new-vs-best games for `promotion_eval_secs`. Returns `(new_wins, games_played)`.
+fn promotion_eval_games(
+    collector: &SelfPlayCollector,
+    config: &TrainingConfig,
+    rng: &mut rand::rngs::StdRng,
+    new_net: &HextoeNet,
+    best_net: &HextoeNet,
+    device: &Device,
+    monitor: &Option<Arc<Mutex<TrainingMonitor>>>,
+    log_stdout: bool,
+    cancel: &Option<Arc<AtomicBool>>,
+) -> (u32, u32) {
+    let budget = Duration::from_secs_f64(config.promotion_eval_secs.max(0.0));
+    let t0 = Instant::now();
+    let mut new_wins = 0u32;
+    let mut games = 0u32;
+
+    while t0.elapsed() < budget {
+        if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
+            break;
+        }
+
+        let new_player = if games % 2 == 0 {
+            Player::X
+        } else {
+            Player::O
+        };
+        let w = collector.play_match_game(
+            config.mcts_iters_per_move,
+            rng,
+            new_net,
+            best_net,
+            new_player,
+            device,
+        );
+        games += 1;
+        if let Some(winner) = w {
+            if winner == new_player {
+                new_wins += 1;
+            }
+        }
+        let outcome = match w {
+            Some(p) => format!("{p:?}"),
+            None => "draw".to_string(),
+        };
+        log_line(
+            monitor,
+            log_stdout,
+            &format!("    promotion game {games}: new as {new_player:?} → {outcome}"),
+        );
+    }
+
+    (new_wins, games)
+}
+
+fn io_to_candle(e: std::io::Error) -> candle_core::Error {
+    candle_core::Error::Msg(format!("{e}"))
 }
 
 /// Run the training loop until [`cancel`] is set (if provided) or forever.
@@ -251,13 +368,17 @@ pub fn run_training(
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
     let model = HextoeNet::new(vb)?;
 
-    if std::path::Path::new(&config.model_path).exists() {
+    if let Some(path) = resolve_initial_checkpoint_path(
+        &config.latest_path,
+        &config.best_path,
+        DEFAULT_LEGACY_MODEL_PATH,
+    ) {
         let mut vm = varmap.clone();
-        match load_weights(&mut vm, &config.model_path) {
+        match load_weights(&mut vm, path) {
             Ok(()) => log_line(
                 &monitor,
                 log_stdout,
-                &format!("Loaded weights from {}", config.model_path),
+                &format!("Loaded weights from {path}"),
             ),
             Err(e) => log_line(
                 &monitor,
@@ -288,8 +409,11 @@ pub fn run_training(
         &monitor,
         log_stdout,
         &format!(
-            "Training loop ({} games/iter, {} MCTS iters/move, {rollout_note}). Tip: lower mcts_iters_per_move, --random-rollout, or --release for faster dry runs.",
-            config.games_per_iter, config.mcts_iters_per_move
+            "Training loop (~{:.0}s self-play / iter, {} MCTS iters/move, {rollout_note}). latest={} best={}",
+            config.self_play_secs,
+            config.mcts_iters_per_move,
+            config.latest_path,
+            config.best_path,
         ),
     );
 
@@ -319,15 +443,16 @@ pub fn run_training(
             &monitor,
             log_stdout,
             &format!(
-                "[iter {iteration}] self-play ({sp_rollout_note}): {} games × {} MCTS iters/move — starting…",
-                config.games_per_iter, config.mcts_iters_per_move
+                "[iter {iteration}] self-play ({sp_rollout_note}): {:.0}s budget × {} MCTS iters/move — starting…",
+                config.self_play_secs,
+                config.mcts_iters_per_move
             ),
         );
 
         let sp_phase = Instant::now();
-        let (new_records, game_secs) = if config.use_random_rollout {
+        let (new_records, game_secs, games_played) = if config.use_random_rollout {
             let mut rollout = RandomRollout;
-            self_play_iteration_batch(
+            self_play_until_duration(
                 &collector,
                 &config,
                 &mut rng,
@@ -342,7 +467,7 @@ pub fn run_training(
                 net: &model,
                 device: &device,
             };
-            self_play_iteration_batch(
+            self_play_until_duration(
                 &collector,
                 &config,
                 &mut rng,
@@ -361,25 +486,27 @@ pub fn run_training(
 
         let sp_total = sp_phase.elapsed().as_secs_f64();
         let sum_g: f64 = game_secs.iter().sum();
-        let min_g = game_secs.iter().copied().fold(f64::INFINITY, f64::min);
-        let max_g = game_secs.iter().copied().fold(0.0_f64, f64::max);
-        let avg_g = if config.games_per_iter > 0 {
-            sum_g / config.games_per_iter as f64
+        let (avg_g, min_g, max_g) = if game_secs.is_empty() {
+            (0.0, 0.0, 0.0)
         } else {
-            0.0
+            let n = game_secs.len() as f64;
+            let min_g = game_secs.iter().copied().fold(f64::INFINITY, f64::min);
+            let max_g = game_secs.iter().copied().fold(0.0_f64, f64::max);
+            (sum_g / n, min_g, max_g)
         };
         if let Some(m) = &monitor {
             if let Ok(mut g) = m.lock() {
                 g.last_self_play_total_secs = sp_total;
                 g.last_iteration_new_records = new_records;
                 g.buffer_len = buffer.len();
+                g.games_this_iter = games_played;
             }
         }
         log_line(
             &monitor,
             log_stdout,
             &format!(
-                "[iter {iteration}] +{new_records} records  buffer {}/{}  |  self-play {sp_total:.1}s total ({avg_g:.2}s/game avg, {min_g:.2}s–{max_g:.2}s min–max)",
+                "[iter {iteration}] +{new_records} records  buffer {}/{}  |  self-play {sp_total:.1}s, {games_played} games ({avg_g:.2}s/game avg, {min_g:.2}s–{max_g:.2}s min–max)",
                 buffer.len(),
                 config.replay_capacity
             ),
@@ -421,12 +548,106 @@ pub fn run_training(
         }
 
         let mut vm = varmap.clone();
-        save_weights(&mut vm, &config.model_path)?;
-        let ck_msg = format!("checkpoint → {}", config.model_path);
+        save_weights(&mut vm, &config.latest_path)?;
+        let ck_msg = format!("checkpoint → {}", config.latest_path);
         log_line(&monitor, log_stdout, &format!("  {ck_msg}"));
         if let Some(m) = &monitor {
             if let Ok(mut g) = m.lock() {
                 g.last_checkpoint_msg = Some(ck_msg);
+            }
+        }
+
+        // Promotion gate: keep `best` unless the new net fails the eval (NN mode only).
+        if config.use_random_rollout {
+            if !Path::new(&config.best_path).is_file() {
+                fs::copy(&config.latest_path, &config.best_path).map_err(io_to_candle)?;
+                let msg = format!(
+                    "promotion: copied latest → best (no prior best; random rollout mode)"
+                );
+                log_line(&monitor, log_stdout, &format!("  {msg}"));
+                if let Some(m) = &monitor {
+                    if let Ok(mut g) = m.lock() {
+                        g.last_promotion_msg = Some(msg);
+                        g.phase = TrainPhase::Idle;
+                    }
+                }
+            } else {
+                let msg = "promotion: skipped (--random-rollout)";
+                log_line(&monitor, log_stdout, &format!("  {msg}"));
+                if let Some(m) = &monitor {
+                    if let Ok(mut g) = m.lock() {
+                        g.last_promotion_msg = Some(msg.to_string());
+                        g.phase = TrainPhase::Idle;
+                    }
+                }
+            }
+            continue;
+        }
+
+        if let Some(m) = &monitor {
+            if let Ok(mut g) = m.lock() {
+                g.phase = TrainPhase::PromotionEval;
+            }
+        }
+
+        if !Path::new(&config.best_path).is_file() {
+            fs::copy(&config.latest_path, &config.best_path).map_err(io_to_candle)?;
+            let msg = "promotion: first best checkpoint (copied from latest)".to_string();
+            log_line(&monitor, log_stdout, &format!("  {msg}"));
+            if let Some(m) = &monitor {
+                if let Ok(mut g) = m.lock() {
+                    g.last_promotion_msg = Some(msg);
+                    g.phase = TrainPhase::Idle;
+                }
+            }
+            continue;
+        }
+
+        let best_loaded = LoadedNet::try_load(&config.best_path, &device)?;
+        log_line(
+            &monitor,
+            log_stdout,
+            &format!(
+                "  promotion eval: {:.0}s new vs best ({})…",
+                config.promotion_eval_secs, config.best_path
+            ),
+        );
+        let (new_wins, promo_games) = promotion_eval_games(
+            &collector,
+            &config,
+            &mut rng,
+            &model,
+            &best_loaded.net,
+            &device,
+            &monitor,
+            log_stdout,
+            &cancel,
+        );
+
+        let rate = if promo_games > 0 {
+            new_wins as f64 / promo_games as f64
+        } else {
+            0.0
+        };
+        let promoted = promo_games > 0 && rate >= config.promotion_min_win_rate;
+        let msg = if promo_games == 0 {
+            "promotion: no eval games in budget — best unchanged".to_string()
+        } else if promoted {
+            fs::copy(&config.latest_path, &config.best_path).map_err(io_to_candle)?;
+            format!(
+                "promotion: new wins {new_wins}/{promo_games} ({rate:.1}%) ≥ {:.0}% → updated best",
+                config.promotion_min_win_rate * 100.0
+            )
+        } else {
+            format!(
+                "promotion: new wins {new_wins}/{promo_games} ({rate:.1}%) < {:.0}% — best unchanged",
+                config.promotion_min_win_rate * 100.0
+            )
+        };
+        log_line(&monitor, log_stdout, &format!("  {msg}"));
+        if let Some(m) = &monitor {
+            if let Ok(mut g) = m.lock() {
+                g.last_promotion_msg = Some(msg);
                 g.phase = TrainPhase::Idle;
             }
         }
