@@ -15,6 +15,10 @@ path = "src/main.rs"
 name = "hextoe-train"
 path = "src/bin/train.rs"
 
+[[bin]]
+name = "hextoe-train-gui"
+path = "src/bin/train_gui.rs"
+
 [dependencies]
 rayon = "1.10"
 eframe = "0.28"

@@ -1,4 +1,5 @@
 use rand::Rng;
+use std::time::{Duration, Instant};
 
 use crate::encode::{action_to_index, board_center, encode_state, CHANNELS, GRID};
 use crate::game::{GameState, Player, Pos};
@@ -100,6 +101,23 @@ impl SelfPlayCollector {
         rng: &mut R,
         rollout: &mut P,
     ) -> Vec<GameRecord> {
+        self.play_game_with_progress(mcts_iters, rng, rollout, |_, _| {})
+    }
+
+    /// Like [`Self::play_game`], but calls `on_mcts` after each MCTS search with the
+    /// 1-based move index and time spent in MCTS for that position (useful for logging).
+    pub fn play_game_with_progress<R, P, F>(
+        &self,
+        mcts_iters: u32,
+        rng: &mut R,
+        rollout: &mut P,
+        mut on_mcts: F,
+    ) -> Vec<GameRecord>
+    where
+        R: Rng,
+        P: RolloutPolicy,
+        F: FnMut(u32, Duration),
+    {
         let mut state = GameState::new();
         // Temporary storage: (encoded_state, pi, player_to_move)
         let mut steps: Vec<([f32; CHANNELS * GRID * GRID], [f32; GRID * GRID], Player)> =
@@ -121,7 +139,10 @@ impl SelfPlayCollector {
 
             // ----- run MCTS -----
             let mut mcts = Mcts::new(state.clone());
+            let t_mcts = Instant::now();
             mcts.search_iters(mcts_iters, rng, rollout);
+            let mcts_dt = t_mcts.elapsed();
+            on_mcts(move_count + 1, mcts_dt);
 
             let children_stats: Vec<(Pos, u32)> = mcts.root_children_stats();
 

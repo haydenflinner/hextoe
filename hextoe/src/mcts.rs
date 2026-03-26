@@ -13,7 +13,7 @@ use rayon::prelude::*;
 const C: f32 = std::f32::consts::SQRT_2;
 
 /// Maximum plies in a game or in a single MCTS rollout (avoids infinite loops).
-pub const MAX_GAME_MOVES: u32 = 1000;
+pub const MAX_GAME_MOVES: u32 = 100;
 
 /// Plays out a position to a terminal state and returns reward from `root_player`'s
 /// perspective: +1 / -1 / 0.
