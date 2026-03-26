@@ -474,6 +474,9 @@ fn promotion_eval_games(
 ) -> (u32, u32) {
     let budget = Duration::from_secs_f64(config.promotion_eval_secs.max(0.0));
     let min_games = config.min_promotion_games;
+    // Promotion gating is only meant to pick a better model. Using the full self-play MCTS
+    // budget here is unnecessarily expensive because it runs many NN leaf evaluations.
+    let eval_mcts_iters = (config.mcts_iters_per_move / 4).max(10);
     let t0 = Instant::now();
     let mut new_wins = 0u32;
     let mut games = 0u32;
@@ -489,7 +492,7 @@ fn promotion_eval_games(
             Player::O
         };
         let w = collector.play_match_game(
-            config.mcts_iters_per_move,
+            eval_mcts_iters,
             rng,
             new_net,
             best_net,
@@ -587,7 +590,8 @@ fn run_population_training(
 ) -> candle_core::Result<()> {
     let device = config.device.clone();
     let pop_size = config.population_size.max(2);
-    let games_per_pair: u32 = 6;
+    let games_per_pair: u32 = 2;
+    let eval_mcts_iters = (config.mcts_iters_per_move / 4).max(10);
     let collector = SelfPlayCollector::new();
     let mut rng = rand::rngs::StdRng::from_entropy();
     let mut buffer = ReplayBuffer::new(config.replay_capacity);
@@ -620,8 +624,8 @@ fn run_population_training(
         &monitor,
         log_stdout,
         &format!(
-            "Population training: {} candidates + incumbent, {:.0}s self-play, {} MCTS iters/move, {} games/pair",
-            pop_size, config.self_play_secs, config.mcts_iters_per_move, games_per_pair
+            "Population training: {} candidates + incumbent, {:.0}s self-play, {} MCTS iters/move (self-play), {} MCTS iters/move (eval), {} games/pair",
+            pop_size, config.self_play_secs, config.mcts_iters_per_move, eval_mcts_iters, games_per_pair
         ),
     );
 
@@ -729,7 +733,7 @@ fn run_population_training(
         log_line(&monitor, log_stdout, "  round-robin tournament…");
         let wins = round_robin_tournament(
             &collector,
-            config.mcts_iters_per_move,
+            eval_mcts_iters,
             &mut rng,
             &all_nets,
             &device,

@@ -75,31 +75,43 @@ impl HextoeNet {
         })
     }
 
+    /// Shared trunk used by both heads.
+    fn forward_trunk(&self, x: &Tensor) -> Result<Tensor> {
+        let mut h = self.init_conv.forward(x)?.relu()?;
+        for b in &self.res {
+            h = b.forward(&h)?;
+        }
+        Ok(h)
+    }
+
+    fn forward_policy_head_from_trunk(&self, h: &Tensor) -> Result<Tensor> {
+        // Returns policy logits with shape [B, GRID * GRID].
+        let p = self.p_conv.forward(h)?.relu()?;
+        let (pb, pc, ph, pw) = p.dims4()?;
+        let p = p.reshape((pb, pc * ph * pw))?;
+        let policy = self.p_fc.forward(&p)?;
+        Ok(policy)
+    }
+
+    fn forward_value_head_from_trunk(&self, h: &Tensor) -> Result<Tensor> {
+        // Returns value with shape [B, 1] in [-1, 1].
+        let v = self.v_conv.forward(h)?.relu()?;
+        let (vb_, vc, vh, vw) = v.dims4()?;
+        let v = v.reshape((vb_, vc * vh * vw))?;
+        let v = self.v_fc1.forward(&v)?.relu()?;
+        let value = self.v_fc2.forward(&v)?.tanh()?;
+        Ok(value)
+    }
+
     /// Forward pass.
     ///
     /// `x`: `[B, CHANNELS, GRID, GRID]`
     ///
     /// Returns `(policy_logits [B, GRID²], value [B, 1])`.
     pub fn forward(&self, x: &Tensor) -> Result<(Tensor, Tensor)> {
-        // Trunk
-        let mut h = self.init_conv.forward(x)?.relu()?;
-        for b in &self.res {
-            h = b.forward(&h)?;
-        }
-
-        // Policy head
-        let p = self.p_conv.forward(&h)?.relu()?;
-        let (pb, pc, ph, pw) = p.dims4()?;
-        let p = p.reshape((pb, pc * ph * pw))?;
-        let policy = self.p_fc.forward(&p)?;
-
-        // Value head
-        let v = self.v_conv.forward(&h)?.relu()?;
-        let (vb_, vc, vh, vw) = v.dims4()?;
-        let v = v.reshape((vb_, vc * vh * vw))?;
-        let v = self.v_fc1.forward(&v)?.relu()?;
-        let value = self.v_fc2.forward(&v)?.tanh()?;
-
+        let h = self.forward_trunk(x)?;
+        let policy = self.forward_policy_head_from_trunk(&h)?;
+        let value = self.forward_value_head_from_trunk(&h)?;
         Ok((policy, value))
     }
 
@@ -116,7 +128,9 @@ impl HextoeNet {
     ) -> Result<(Vec<f32>, f32)> {
         let enc = encode_state(state);
         let t = Tensor::from_slice(&enc, (1usize, CHANNELS, GRID, GRID), device)?;
-        let (logits, value_t) = self.forward(&t)?;
+        let h = self.forward_trunk(&t)?;
+        let logits = self.forward_policy_head_from_trunk(&h)?;
+        let value_t = self.forward_value_head_from_trunk(&h)?;
 
         // Mask logits: set non-legal positions to -inf, then softmax.
         let center = board_center(state);
@@ -135,6 +149,21 @@ impl HextoeNet {
         let v: f32 = value_t.reshape((1usize,))?.to_vec1::<f32>()?[0];
 
         Ok((probs_vec, v))
+    }
+
+    /// Evaluate a single game position, returning only the value head.
+    ///
+    /// This is used by MCTS leaf evaluation; we avoid computing the policy head and
+    /// the legal-move mask/softmax to keep self-play/tournament fast.
+    ///
+    /// Returns `value` in `[-1, 1]` from the *current player's* perspective.
+    pub fn evaluate_value_state(&self, state: &GameState, device: &Device) -> Result<f32> {
+        let enc = encode_state(state);
+        let t = Tensor::from_slice(&enc, (1usize, CHANNELS, GRID, GRID), device)?;
+        let h = self.forward_trunk(&t)?;
+        let value_t = self.forward_value_head_from_trunk(&h)?;
+        let v: f32 = value_t.reshape((1usize,))?.to_vec1::<f32>()?[0];
+        Ok(v)
     }
 }
 
@@ -218,8 +247,8 @@ pub fn neural_leaf_value_policy(
             None => 0.0,
         };
     }
-    match net.evaluate_state(&state, device) {
-        Ok((_, v)) => {
+    match net.evaluate_value_state(&state, device) {
+        Ok(v) => {
             let cp = state.current_player();
             if cp == root_player {
                 v
