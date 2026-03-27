@@ -10,10 +10,11 @@
 
 use serde::Deserialize;
 
-use crate::encode::{action_to_index, board_center, encode_state, CHANNELS, GRID};
-use crate::game::{GameState, Player};
+use crate::encode::{action_to_index, board_center, encode_state, GRID};
+use crate::game::{GameState, Player, Pos};
 use crate::nnue::encode_nnue;
 use crate::self_play::GameRecord;
+use crate::symmetry::{apply_transform, transform_state};
 
 // ── JSON schema ───────────────────────────────────────────────────────────────
 
@@ -121,54 +122,55 @@ fn process_game(game: &GameJson) -> Option<Vec<GameRecord>> {
     let winner_is_first = winner_id == first_player_id;
     let winner_player = if winner_is_first { Player::X } else { Player::O };
 
-    // Replay the game, recording (state_enc, pi, current_player) at each move.
+    // Replay the game, storing (state-before-move, pos, player) for later augmentation.
     let mut state = GameState::new();
-    // steps: (state_enc, pi, player_to_move)
-    let mut steps: Vec<([f32; CHANNELS * GRID * GRID], [f32; GRID * GRID], Player, Vec<u16>)> =
-        Vec::new();
+    let mut steps: Vec<(GameState, Pos, Player)> = Vec::new();
 
     for m in &moves {
         if state.is_terminal() {
             break;
         }
-
         let pos = (m.x, m.y);
-        let center = board_center(&state);
         let current_player = state.current_player();
-
-        // Build one-hot pi. Skip positions where the move falls outside the encoding window.
-        let mut pi = [0.0f32; GRID * GRID];
-        if let Some(idx) = action_to_index(pos, center) {
-            pi[idx] = 1.0;
-            let state_enc = encode_state(&state);
-            let nnue_feats: Vec<u16> =
-                encode_nnue(&state, center).into_iter().map(|f| f as u16).collect();
-            steps.push((state_enc, pi, current_player, nnue_feats));
-        }
-        // Whether or not we recorded this step, always advance the game state.
+        let snapshot = state.clone();
         if !state.place(pos) {
             // Illegal move — data is corrupt; discard the whole game.
             return None;
         }
+        steps.push((snapshot, pos, current_player));
     }
 
     if steps.is_empty() {
         return None;
     }
 
-    // Convert (state_enc, pi, player) → GameRecord with outcome from player's perspective.
-    Some(
-        steps
-            .into_iter()
-            .map(|(state_enc, pi, player, nnue_feats)| {
-                let outcome = if player == winner_player { 1.0f32 } else { -1.0f32 };
-                GameRecord {
-                    state_enc: Box::new(state_enc),
-                    pi: Box::new(pi),
-                    outcome,
-                    nnue_feats,
-                }
-            })
-            .collect(),
-    )
+    // Expand each step × 12 D₆ symmetry transforms, then encode.
+    // This multiplies the training data by up to 12× for free.
+    let mut records: Vec<GameRecord> = Vec::new();
+    for (snap, pos, player) in &steps {
+        let outcome = if *player == winner_player { 1.0f32 } else { -1.0f32 };
+        for tid in 0u8..12 {
+            let ts = transform_state(snap, tid);
+            let tc = board_center(&ts);
+            let tp: Pos = apply_transform(tid, pos.0, pos.1);
+
+            // Skip if the (transformed) played move falls outside the encoding window.
+            let Some(idx) = action_to_index(tp, tc) else { continue };
+            let mut pi = [0.0f32; GRID * GRID];
+            pi[idx] = 1.0;
+
+            let state_enc = encode_state(&ts);
+            let nnue_feats: Vec<u16> =
+                encode_nnue(&ts, tc).into_iter().map(|f| f as u16).collect();
+
+            records.push(GameRecord {
+                state_enc: Box::new(state_enc),
+                pi: Box::new(pi),
+                outcome,
+                nnue_feats,
+            });
+        }
+    }
+
+    if records.is_empty() { None } else { Some(records) }
 }
