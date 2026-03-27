@@ -348,8 +348,9 @@ impl RolloutPolicy for NNUERollout {
         Some(raw.into_iter().map(|(p, w)| (p, w / total)).collect())
     }
 
-    /// Pure CPU + `Arc` → safe to call from multiple threads at once.
-    const PARALLEL_SAFE: bool = true;
+    /// Serial within a single game tree so PUCT priors guide the search correctly.
+    /// Game-level parallelism (multiple concurrent self-play games) still works fine.
+    const PARALLEL_SAFE: bool = false;
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
