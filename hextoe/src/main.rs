@@ -2,8 +2,10 @@ use hextoe::device::default_inference_device;
 use hextoe::game::{winning_line, GameState, Player, Pos};
 use hextoe::mcts::{Mcts, RandomRollout};
 use hextoe::nn::{LoadedNet, NeuralRollout};
+use hextoe::nnue::{NNUERollout, NNUEWeights, DEFAULT_NNUE_PATH};
 use hextoe::train::default_inference_checkpoint_path;
 
+use candle_core::Device as CandleDevice;
 use eframe::egui;
 use egui::{Color32, FontId, Pos2, RichText, Stroke};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,6 +21,7 @@ const BATCH_SIZE: u32 = 300;
 enum RolloutMode {
     Random,
     Neural,
+    Nnue,
 }
 
 impl RolloutMode {
@@ -26,6 +29,7 @@ impl RolloutMode {
         match self {
             RolloutMode::Random => "Random rollout",
             RolloutMode::Neural => "NN-based rollout",
+            RolloutMode::Nnue => "NNUE rollout",
         }
     }
 }
@@ -50,6 +54,8 @@ struct App {
     game: GameState,
     /// A training checkpoint exists (latest / best / legacy); each MCTS thread loads its own copy.
     nn_checkpoint_hint: bool,
+    /// An NNUE checkpoint exists at DEFAULT_NNUE_PATH.
+    nnue_checkpoint_hint: bool,
     /// Current best suggestions: (pos, score 0–1, visits, policy_share).
     suggestions: Vec<(Pos, f32, u32, f32)>,
     /// Total MCTS iterations accumulated since the last move.
@@ -66,16 +72,20 @@ struct App {
 impl App {
     fn new() -> Self {
         let nn_checkpoint_hint = default_inference_checkpoint_path().is_some();
+        let nnue_checkpoint_hint = std::path::Path::new(DEFAULT_NNUE_PATH).exists();
         let mut app = App {
             game: GameState::new(),
             nn_checkpoint_hint,
+            nnue_checkpoint_hint,
             suggestions: vec![],
             mcts_iters: 0,
             cancel: Arc::new(AtomicBool::new(false)),
             result_rx: None,
             last_pos: None,
             pan_offset: egui::Vec2::ZERO,
-            rollout_mode: if nn_checkpoint_hint {
+            rollout_mode: if nnue_checkpoint_hint {
+                RolloutMode::Nnue
+            } else if nn_checkpoint_hint {
                 RolloutMode::Neural
             } else {
                 RolloutMode::Random
@@ -106,20 +116,33 @@ impl App {
 
         thread::spawn(move || {
             let device = default_inference_device();
-            let loaded_nn = default_inference_checkpoint_path()
-                .and_then(|p| LoadedNet::try_load(p, &device).ok());
+            let loaded_nn = if rollout_mode == RolloutMode::Neural {
+                default_inference_checkpoint_path()
+                    .and_then(|p| LoadedNet::try_load(p, &device).ok())
+            } else {
+                None
+            };
+            let nnue_weights = if rollout_mode == RolloutMode::Nnue {
+                NNUEWeights::load(DEFAULT_NNUE_PATH, &CandleDevice::Cpu).ok().map(Arc::new)
+            } else {
+                None
+            };
             let mut rng = rand::thread_rng();
             let mut mcts = Mcts::new(game);
             loop {
                 if cancel.load(Ordering::Relaxed) {
                     break;
                 }
-                match (rollout_mode, &loaded_nn) {
-                    (RolloutMode::Neural, Some(ld)) => {
+                match (rollout_mode, &loaded_nn, &nnue_weights) {
+                    (RolloutMode::Neural, Some(ld), _) => {
                         let r = NeuralRollout {
                             net: &ld.net,
                             device: &device,
                         };
+                        mcts.search_iters(BATCH_SIZE, &mut rng, &r);
+                    }
+                    (RolloutMode::Nnue, _, Some(w)) => {
+                        let r = NNUERollout::new(Arc::clone(w));
                         mcts.search_iters(BATCH_SIZE, &mut rng, &r);
                     }
                     _ => {
@@ -323,18 +346,9 @@ impl eframe::App for App {
 
                 ui.label(RichText::new("Analysis mode").strong());
                 let mut next_mode = self.rollout_mode;
-                ui.horizontal(|ui| {
-                    ui.radio_value(
-                        &mut next_mode,
-                        RolloutMode::Random,
-                        RolloutMode::Random.label(),
-                    );
-                    ui.radio_value(
-                        &mut next_mode,
-                        RolloutMode::Neural,
-                        RolloutMode::Neural.label(),
-                    );
-                });
+                ui.radio_value(&mut next_mode, RolloutMode::Random, RolloutMode::Random.label());
+                ui.radio_value(&mut next_mode, RolloutMode::Neural, RolloutMode::Neural.label());
+                ui.radio_value(&mut next_mode, RolloutMode::Nnue, RolloutMode::Nnue.label());
                 if next_mode != self.rollout_mode {
                     self.rollout_mode = next_mode;
                     self.suggestions.clear();
@@ -343,6 +357,13 @@ impl eframe::App for App {
                 if self.rollout_mode == RolloutMode::Neural && !self.nn_checkpoint_hint {
                     ui.label(
                         RichText::new("No checkpoint found: falling back to random rollout.")
+                            .size(11.0)
+                            .color(Color32::from_rgb(200, 160, 90)),
+                    );
+                }
+                if self.rollout_mode == RolloutMode::Nnue && !self.nnue_checkpoint_hint {
+                    ui.label(
+                        RichText::new("No NNUE checkpoint found: falling back to random rollout.")
                             .size(11.0)
                             .color(Color32::from_rgb(200, 160, 90)),
                     );
@@ -363,6 +384,15 @@ impl eframe::App for App {
                             )
                             .size(12.0)
                             .color(Color32::from_rgb(120, 200, 140)),
+                        );
+                        ui.add_space(4.0);
+                    } else if self.rollout_mode == RolloutMode::Nnue && self.nnue_checkpoint_hint {
+                        ui.label(
+                            RichText::new(
+                                "Analysis: NNUE value + tactical priors (fast CPU eval)",
+                            )
+                            .size(12.0)
+                            .color(Color32::from_rgb(120, 200, 200)),
                         );
                         ui.add_space(4.0);
                     } else {
