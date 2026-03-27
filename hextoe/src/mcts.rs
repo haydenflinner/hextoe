@@ -10,7 +10,10 @@ use crate::game::{GameState, Player, Pos};
 use rand::Rng;
 use rayon::prelude::*;
 
+/// Exploration constant for UCB1 (random rollout path).
 const C: f32 = std::f32::consts::SQRT_2;
+/// Exploration constant for PUCT (NN policy path).
+const C_PUCT: f32 = 2.0;
 
 /// Maximum plies in a game or in a single MCTS rollout (avoids infinite loops).
 pub const MAX_GAME_MOVES: u32 = 100;
@@ -22,7 +25,19 @@ const ROLLOUT_CONTINUATION_BIAS: f32 = 0.35;
 /// Plays out a position to a terminal state and returns reward from `root_player`'s
 /// perspective: +1 / -1 / 0.
 pub trait RolloutPolicy {
-    fn rollout(&self, state: GameState, root_player: Player, rng: &mut impl Rng) -> f32;
+    /// Evaluate a leaf position. Returns `(value, child_priors)`.
+    ///
+    /// `value` is the backup target in `[-1, 1]` from `root_player`'s perspective.
+    /// `child_priors` is `Some(priors)` when the rollout policy has a learnt policy
+    /// head (NN-based), or `None` for policies without one (random rollout → UCB1).
+    fn rollout(&self, state: GameState, root_player: Player, rng: &mut impl Rng) -> (f32, Option<Vec<(Pos, f32)>>);
+
+    /// Return policy priors for `state`'s legal actions without doing a full rollout.
+    /// Used to initialise the root node before the search loop begins.
+    /// Returns `None` for rollout policies without a policy network (→ UCB1 selection).
+    fn priors_only(&self, _state: &GameState) -> Option<Vec<(Pos, f32)>> {
+        None
+    }
 
     /// If true, root-parallel search may use an equivalent stateless rollout
     /// ([`RandomRollout`] only). Other policies always run serially.
@@ -73,13 +88,13 @@ fn rollout_pick_action(
 }
 
 impl RolloutPolicy for RandomRollout {
-    fn rollout(&self, mut state: GameState, root_player: Player, rng: &mut impl Rng) -> f32 {
+    fn rollout(&self, mut state: GameState, root_player: Player, rng: &mut impl Rng) -> (f32, Option<Vec<(Pos, f32)>>) {
         let mut ply = 0u32;
         let mut x_hist = LastTwoMoves::default();
         let mut o_hist = LastTwoMoves::default();
         while !state.is_terminal() {
             if ply >= MAX_GAME_MOVES {
-                return state.board_heuristic(root_player);
+                return (state.board_heuristic(root_player), None);
             }
             let actions = state.legal_actions();
             if actions.is_empty() {
@@ -94,11 +109,12 @@ impl RolloutPolicy for RandomRollout {
             }
             ply += 1;
         }
-        match state.winner {
+        let value = match state.winner {
             Some(p) if p == root_player => 1.0,
             Some(_) => -1.0,
             None => state.board_heuristic(root_player),
-        }
+        };
+        (value, None)
     }
 
     const PARALLEL_SAFE: bool = true;
@@ -114,6 +130,10 @@ struct Node {
     visits: u32,
     /// Actions not yet expanded into child nodes (random-ordered during expand).
     unexpanded: Vec<Pos>,
+    /// Prior probability from parent's NN policy evaluation. 0.0 → fall back to UCB1.
+    prior: f32,
+    /// Cached NN policy priors for children (set on first NN evaluation of this node's state).
+    children_priors: Option<Vec<(Pos, f32)>>,
 }
 
 pub struct Mcts {
@@ -133,6 +153,8 @@ impl Mcts {
             total_value: 0.0,
             visits: 0,
             unexpanded,
+            prior: 0.0,
+            children_priors: None,
         };
         Mcts {
             nodes: vec![root],
@@ -148,6 +170,12 @@ impl Mcts {
     /// Parallel workers each run from an empty tree on a clone of the root
     /// [`GameState`], then statistics are merged additively into this tree.
     pub fn search_iters<P: RolloutPolicy>(&mut self, n: u32, rng: &mut impl Rng, rollout: &P) {
+        // Initialise root children_priors for PUCT (no-op when rollout returns None priors).
+        if self.nodes[0].children_priors.is_none() {
+            if let Some(priors) = rollout.priors_only(&self.nodes[0].state) {
+                self.nodes[0].children_priors = Some(priors);
+            }
+        }
         let threads = rayon::current_num_threads().max(1);
         if n == 0 {
             return;
@@ -169,8 +197,11 @@ impl Mcts {
     ) {
         for _ in 0..n {
             let leaf = self.select(0);
-            let child = self.expand(leaf, rng);
-            let reward = self.simulate(child, rng, rollout);
+            let child = self.expand(leaf, rng, rollout);
+            let (reward, priors) = self.simulate(child, rng, rollout);
+            if let Some(p) = priors {
+                self.nodes[child].children_priors = Some(p);
+            }
             self.backprop(child, reward);
         }
     }
@@ -251,6 +282,8 @@ impl Mcts {
                 total_value: node.total_value,
                 visits: node.visits,
                 unexpanded: node.unexpanded.clone(),
+                prior: node.prior,
+                children_priors: node.children_priors.clone(),
             };
             let nid = this.nodes.len();
             this.nodes.push(new_node);
@@ -337,10 +370,19 @@ impl Mcts {
         rng: &mut impl Rng,
         rollout: &P,
     ) -> Vec<(Pos, f32, u32, f32)> {
+        // Initialise root children_priors for PUCT (no-op for random rollout).
+        if self.nodes[0].children_priors.is_none() {
+            if let Some(priors) = rollout.priors_only(&self.nodes[0].state) {
+                self.nodes[0].children_priors = Some(priors);
+            }
+        }
         for _ in 0..iterations {
             let leaf = self.select(0);
-            let child = self.expand(leaf, rng);
-            let reward = self.simulate(child, rng, rollout);
+            let child = self.expand(leaf, rng, rollout);
+            let (reward, priors) = self.simulate(child, rng, rollout);
+            if let Some(p) = priors {
+                self.nodes[child].children_priors = Some(p);
+            }
             self.backprop(child, reward);
         }
 
@@ -349,7 +391,10 @@ impl Mcts {
 
     // ── Private helpers ──────────────────────────────────────────────────────
 
-    /// UCB1 value of `node_id` from the perspective of its parent's player.
+    /// Selection score for `node_id`.
+    ///
+    /// Uses PUCT (AlphaZero-style) when the node has a policy prior (`prior > 0`),
+    /// otherwise falls back to UCB1 (random-rollout path).
     fn ucb(&self, node_id: usize) -> f32 {
         let node = &self.nodes[node_id];
         if node.visits == 0 {
@@ -367,7 +412,13 @@ impl Mcts {
         } else {
             -node.total_value / node.visits as f32
         };
-        q + C * ((parent.visits as f32).ln() / node.visits as f32).sqrt()
+        if node.prior > 0.0 {
+            // PUCT: policy prior biases exploration toward moves the network prefers.
+            q + C_PUCT * node.prior * (parent.visits as f32).sqrt() / (1.0 + node.visits as f32)
+        } else {
+            // UCB1: standard exploration when no policy priors are available.
+            q + C * ((parent.visits as f32).ln() / node.visits as f32).sqrt()
+        }
     }
 
     /// Walk down the tree using UCB until a node with unexpanded actions (or
@@ -389,8 +440,8 @@ impl Mcts {
         }
     }
 
-    /// Pick one unexpanded action at random, create a child node, return its id.
-    fn expand(&mut self, id: usize, rng: &mut impl Rng) -> usize {
+    /// Pick one unexpanded action, create a child node with its PUCT prior, return its id.
+    fn expand<P: RolloutPolicy>(&mut self, id: usize, rng: &mut impl Rng, rollout: &P) -> usize {
         if self.nodes[id].state.is_terminal() {
             return id;
         }
@@ -398,8 +449,24 @@ impl Mcts {
             return id;
         }
 
+        // Lazily initialise children_priors for this node if not yet set.
+        // This fires for the root on its first expansion; deeper nodes get their
+        // children_priors set by the simulate return value.
+        if self.nodes[id].children_priors.is_none() {
+            if let Some(priors) = rollout.priors_only(&self.nodes[id].state) {
+                self.nodes[id].children_priors = Some(priors);
+            }
+        }
+
         let idx = rng.gen_range(0..self.nodes[id].unexpanded.len());
         let action = self.nodes[id].unexpanded.swap_remove(idx);
+
+        // Look up the NN policy prior for this action. 0.0 → UCB1 used in ucb().
+        let prior = self.nodes[id]
+            .children_priors
+            .as_ref()
+            .and_then(|ps| ps.iter().find(|(p, _)| *p == action).map(|(_, pr)| *pr))
+            .unwrap_or(0.0);
 
         let mut new_state = self.nodes[id].state.clone();
         new_state.place(action);
@@ -413,6 +480,8 @@ impl Mcts {
             total_value: 0.0,
             visits: 0,
             unexpanded,
+            prior,
+            children_priors: None,
         };
 
         let child_id = self.nodes.len();
@@ -421,13 +490,16 @@ impl Mcts {
         child_id
     }
 
-    /// Rollout from node `id` using `rollout`; returns +1 (root wins) / -1 / 0.
+    /// Rollout from node `id`. Returns `(value, child_priors)`.
+    ///
+    /// For NN rollouts the returned priors should be stored in `nodes[id].children_priors`
+    /// so subsequent expansions of that node can use PUCT selection.
     fn simulate<P: RolloutPolicy>(
         &self,
         id: usize,
         rng: &mut impl Rng,
         rollout: &P,
-    ) -> f32 {
+    ) -> (f32, Option<Vec<(Pos, f32)>>) {
         let state = self.nodes[id].state.clone();
         rollout.rollout(state, self.root_player, rng)
     }

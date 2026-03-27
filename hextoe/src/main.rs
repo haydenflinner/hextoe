@@ -14,6 +14,22 @@ use std::thread;
 const HEX_SIZE: f32 = 32.0;
 /// Iterations per batch sent by the background thread.
 const BATCH_SIZE: u32 = 300;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RolloutMode {
+    Random,
+    Neural,
+}
+
+impl RolloutMode {
+    fn label(self) -> &'static str {
+        match self {
+            RolloutMode::Random => "Random rollout",
+            RolloutMode::Neural => "NN-based rollout",
+        }
+    }
+}
+
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -44,6 +60,7 @@ struct App {
     result_rx: Option<Receiver<(Vec<(Pos, f32, u32, f32)>, u32)>>,
     last_pos: Option<Pos>,
     pan_offset: egui::Vec2,
+    rollout_mode: RolloutMode,
 }
 
 impl App {
@@ -58,6 +75,11 @@ impl App {
             result_rx: None,
             last_pos: None,
             pan_offset: egui::Vec2::ZERO,
+            rollout_mode: if nn_checkpoint_hint {
+                RolloutMode::Neural
+            } else {
+                RolloutMode::Random
+            },
         };
         app.restart_mcts();
         app
@@ -80,6 +102,7 @@ impl App {
 
         let (tx, rx) = mpsc::channel();
         let game = self.game.clone();
+        let rollout_mode = self.rollout_mode;
 
         thread::spawn(move || {
             let device = default_inference_device();
@@ -91,15 +114,15 @@ impl App {
                 if cancel.load(Ordering::Relaxed) {
                     break;
                 }
-                match &loaded_nn {
-                    Some(ld) => {
+                match (rollout_mode, &loaded_nn) {
+                    (RolloutMode::Neural, Some(ld)) => {
                         let r = NeuralRollout {
                             net: &ld.net,
                             device: &device,
                         };
                         mcts.search_iters(BATCH_SIZE, &mut rng, &r);
                     }
-                    None => {
+                    _ => {
                         let r = RandomRollout;
                         mcts.search_iters(BATCH_SIZE, &mut rng, &r);
                     }
@@ -298,6 +321,34 @@ impl eframe::App for App {
                 ui.separator();
                 ui.add_space(4.0);
 
+                ui.label(RichText::new("Analysis mode").strong());
+                let mut next_mode = self.rollout_mode;
+                ui.horizontal(|ui| {
+                    ui.radio_value(
+                        &mut next_mode,
+                        RolloutMode::Random,
+                        RolloutMode::Random.label(),
+                    );
+                    ui.radio_value(
+                        &mut next_mode,
+                        RolloutMode::Neural,
+                        RolloutMode::Neural.label(),
+                    );
+                });
+                if next_mode != self.rollout_mode {
+                    self.rollout_mode = next_mode;
+                    self.suggestions.clear();
+                    self.restart_mcts();
+                }
+                if self.rollout_mode == RolloutMode::Neural && !self.nn_checkpoint_hint {
+                    ui.label(
+                        RichText::new("No checkpoint found: falling back to random rollout.")
+                            .size(11.0)
+                            .color(Color32::from_rgb(200, 160, 90)),
+                    );
+                }
+                ui.add_space(4.0);
+
                 // ── MCTS suggestions ───────────────────────────────────────
                 if self.game.is_terminal() {
                     // nothing
@@ -305,7 +356,7 @@ impl eframe::App for App {
                     ui.label("Analysing…");
                     ui.spinner();
                 } else {
-                    if self.nn_checkpoint_hint {
+                    if self.rollout_mode == RolloutMode::Neural && self.nn_checkpoint_hint {
                         ui.label(
                             RichText::new(
                                 "Analysis: NN value at leaves (AlphaZero-style; not MC win %)",

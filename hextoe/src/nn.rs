@@ -12,7 +12,7 @@ use candle_nn::{conv2d, linear, Conv2d, Conv2dConfig, Linear, Module, VarBuilder
 use rand::Rng;
 
 use crate::encode::{action_to_index, board_center, encode_state, index_to_action, CHANNELS, GRID};
-use crate::game::{GameState, Player};
+use crate::game::{GameState, Player, Pos};
 use crate::mcts::{RandomRollout, RolloutPolicy, MAX_GAME_MOVES};
 
 const HIDDEN: usize = 64;
@@ -218,7 +218,7 @@ pub fn neural_rollout_policy(
             }
             Err(_) => {
                 let fallback = RandomRollout;
-                return fallback.rollout(state, root_player, rng);
+                return fallback.rollout(state, root_player, rng).0;
             }
         };
         state.place(pos);
@@ -250,15 +250,65 @@ pub fn neural_leaf_value_policy(
     match net.evaluate_value_state(&state, device) {
         Ok(v) => {
             let cp = state.current_player();
-            if cp == root_player {
-                v
-            } else {
-                -v
-            }
+            if cp == root_player { v } else { -v }
         }
         Err(_) => {
             let fallback = RandomRollout;
-            fallback.rollout(state, root_player, rng)
+            fallback.rollout(state, root_player, rng).0
+        }
+    }
+}
+
+/// Extract PUCT priors for `state`'s legal actions from a network forward pass.
+fn nn_priors(net: &HextoeNet, device: &Device, state: &GameState) -> Option<Vec<(Pos, f32)>> {
+    let center = board_center(state);
+    let (probs, _) = net.evaluate_state(state, device).ok()?;
+    let legal = state.legal_actions();
+    Some(
+        legal
+            .iter()
+            .filter_map(|&pos| {
+                let idx = action_to_index(pos, center)?;
+                Some((pos, probs[idx]))
+            })
+            .collect(),
+    )
+}
+
+/// Evaluate a leaf position with the NN, returning `(value, child_priors)` in one pass.
+fn nn_leaf_eval(
+    net: &HextoeNet,
+    device: &Device,
+    state: &GameState,
+    root_player: Player,
+    rng: &mut impl Rng,
+) -> (f32, Option<Vec<(Pos, f32)>>) {
+    if state.is_terminal() {
+        let v = match state.winner {
+            Some(p) if p == root_player => 1.0,
+            Some(_) => -1.0,
+            None => 0.0,
+        };
+        return (v, None);
+    }
+    let center = board_center(state);
+    match net.evaluate_state(state, device) {
+        Ok((probs, v)) => {
+            let cp = state.current_player();
+            let value = if cp == root_player { v } else { -v };
+            let legal = state.legal_actions();
+            let priors: Vec<(Pos, f32)> = legal
+                .iter()
+                .filter_map(|&pos| {
+                    let idx = action_to_index(pos, center)?;
+                    Some((pos, probs[idx]))
+                })
+                .collect();
+            (value, Some(priors))
+        }
+        Err(_) => {
+            let (v, _) = RandomRollout.rollout(state.clone(), root_player, rng);
+            (v, None)
         }
     }
 }
@@ -287,8 +337,13 @@ pub struct NeuralRollout<'a> {
 }
 
 impl RolloutPolicy for NeuralRollout<'_> {
-    fn rollout(&self, state: GameState, root_player: Player, rng: &mut impl Rng) -> f32 {
-        neural_leaf_value_policy(self.net, self.device, state, root_player, rng)
+    /// Single NN forward pass: returns leaf value + policy priors for the leaf's children.
+    fn rollout(&self, state: GameState, root_player: Player, rng: &mut impl Rng) -> (f32, Option<Vec<(Pos, f32)>>) {
+        nn_leaf_eval(self.net, self.device, &state, root_player, rng)
+    }
+
+    fn priors_only(&self, state: &GameState) -> Option<Vec<(Pos, f32)>> {
+        nn_priors(self.net, self.device, state)
     }
 
     const PARALLEL_SAFE: bool = false;
@@ -303,13 +358,22 @@ pub struct DualNetRollout<'a> {
 }
 
 impl RolloutPolicy for DualNetRollout<'_> {
-    fn rollout(&self, state: GameState, root_player: Player, rng: &mut impl Rng) -> f32 {
+    fn rollout(&self, state: GameState, root_player: Player, rng: &mut impl Rng) -> (f32, Option<Vec<(Pos, f32)>>) {
         let net = if state.current_player() == self.new_player {
             self.new_net
         } else {
             self.best_net
         };
-        neural_leaf_value_policy(net, self.device, state, root_player, rng)
+        nn_leaf_eval(net, self.device, &state, root_player, rng)
+    }
+
+    fn priors_only(&self, state: &GameState) -> Option<Vec<(Pos, f32)>> {
+        let net = if state.current_player() == self.new_player {
+            self.new_net
+        } else {
+            self.best_net
+        };
+        nn_priors(net, self.device, state)
     }
 
     const PARALLEL_SAFE: bool = false;
