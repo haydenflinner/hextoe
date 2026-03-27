@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
+use std::time::Instant;
 
 const HEX_SIZE: f32 = 32.0;
 /// Iterations per batch sent by the background thread.
@@ -71,6 +72,8 @@ struct App {
     rollout_mode: RolloutMode,
     /// Receives game state updates from the REST API (bookmarklet).
     api_rx: Receiver<GameUpdate>,
+    /// When the last API message arrived (for the activity flash).
+    last_api_msg: Option<Instant>,
 }
 
 impl App {
@@ -96,6 +99,7 @@ impl App {
                 RolloutMode::Random
             },
             api_rx,
+            last_api_msg: None,
         };
         app.restart_mcts();
         app
@@ -358,6 +362,7 @@ impl eframe::App for App {
 
         // Drain REST API updates from the bookmarklet.
         while let Ok(update) = self.api_rx.try_recv() {
+            self.last_api_msg = Some(Instant::now());
             match update {
                 GameUpdate::Reset(state) => {
                     self.game = state;
@@ -538,6 +543,39 @@ impl eframe::App for App {
                 ui.label("• Drag to pan the board");
 
                 ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(4.0);
+
+                // ── REST API status ────────────────────────────────────────
+                {
+                    const FADE_SECS: f32 = 2.0;
+                    let age = self.last_api_msg
+                        .map(|t| t.elapsed().as_secs_f32())
+                        .unwrap_or(f32::MAX);
+                    // Dot colour: bright green → dim green over FADE_SECS.
+                    let (dot_col, label) = if age < FADE_SECS {
+                        let t = 1.0 - (age / FADE_SECS);
+                        let g = (55.0 + 200.0 * t) as u8;
+                        (Color32::from_rgb(30, g, 60), "API: received")
+                    } else {
+                        (Color32::from_rgb(30, 80, 50), "API: listening :8080")
+                    };
+                    ui.horizontal(|ui| {
+                        // Filled circle as activity dot.
+                        let (rect, _) = ui.allocate_exact_size(
+                            egui::vec2(10.0, 10.0),
+                            egui::Sense::hover(),
+                        );
+                        ui.painter().circle_filled(rect.center(), 5.0, dot_col);
+                        ui.label(RichText::new(label).size(11.0).color(dot_col));
+                    });
+                    // Keep repainting while the flash is still fading.
+                    if age < FADE_SECS {
+                        ctx.request_repaint();
+                    }
+                }
+
+                ui.add_space(4.0);
                 ui.separator();
                 if ui
                     .add_sized([210.0, 32.0], egui::Button::new("New Game"))
