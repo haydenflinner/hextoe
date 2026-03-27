@@ -304,15 +304,15 @@ fn fit_suggestion_galley_in_hex(
 
 fn player_color(p: Player) -> Color32 {
     match p {
-        Player::X => Color32::from_rgb(70, 140, 220),
-        Player::O => Color32::from_rgb(220, 70, 70),
+        Player::X => Color32::from_rgb(230, 120, 30),
+        Player::O => Color32::from_rgb(70, 140, 220),
     }
 }
 
 fn player_dark(p: Player) -> Color32 {
     match p {
-        Player::X => Color32::from_rgb(45, 95, 165),
-        Player::O => Color32::from_rgb(165, 45, 45),
+        Player::X => Color32::from_rgb(170, 85, 15),
+        Player::O => Color32::from_rgb(45, 95, 165),
     }
 }
 
@@ -326,8 +326,8 @@ fn cell_fill(
     if let Some(player) = game.board.get(&pos) {
         return if win_cells.contains(&pos) {
             match player {
-                Player::X => Color32::from_rgb(110, 195, 255),
-                Player::O => Color32::from_rgb(255, 120, 120),
+                Player::X => Color32::from_rgb(255, 175, 80),
+                Player::O => Color32::from_rgb(110, 195, 255),
             }
         } else {
             player_dark(*player)
@@ -685,14 +685,8 @@ impl eframe::App for App {
                 ));
 
                 // Labels.
-                if let Some(player) = self.game.board.get(pos) {
-                    painter.text(
-                        centre,
-                        egui::Align2::CENTER_CENTER,
-                        if *player == Player::X { "X" } else { "O" },
-                        FontId::proportional(HEX_SIZE * 0.65),
-                        Color32::WHITE,
-                    );
+                if self.game.board.get(pos).is_some() {
+                    // Color already set in cell_fill; no text label.
                 } else if let Some(&(rank, wr, visits, pol)) = suggestion_map.get(pos) {
                     let marker = ["①", "②", "③"][rank];
                     let label = format!(
