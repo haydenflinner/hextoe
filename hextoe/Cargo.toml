@@ -26,6 +26,7 @@ egui = "0.28"
 rand = "0.8"
 candle-core = "0.8"
 candle-nn = "0.8"
+sysinfo = "0.38.4"
 
 # Metal GPU on Apple Silicon / macOS (no effect on other targets).
 [target.'cfg(target_os = "macos")'.dependencies]

@@ -33,9 +33,9 @@ pub const DEFAULT_LEGACY_MODEL_PATH: &str = "hextoe_model.safetensors";
 pub const DEFAULT_REPLAY_CAPACITY: usize = 50_000;
 pub const DEFAULT_MIN_BUFFER_FOR_TRAINING: usize = 500;
 /// Wall-clock budget for self-play before each training step.
-pub const DEFAULT_SELF_PLAY_SECS: f64 = 60.0;
+pub const DEFAULT_SELF_PLAY_SECS: f64 = 60.0 * 3.0;
 /// Wall-clock budget for new-vs-best games after training.
-pub const DEFAULT_PROMOTION_EVAL_SECS: f64 = 120.0;
+pub const DEFAULT_PROMOTION_EVAL_SECS: f64 = 60.0;
 /// Promote `latest` → `best` if new wins at least this fraction of eval games (no draws counted in denominator).
 pub const DEFAULT_PROMOTION_MIN_WIN_RATE: f64 = 0.52;
 pub const DEFAULT_MCTS_ITERS_PER_MOVE: u32 = 100;
