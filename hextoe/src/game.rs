@@ -92,6 +92,29 @@ impl GameState {
         true
     }
 
+    /// Reconstruct a `GameState` from a known set of cells and move count.
+    /// Used to sync from external game state (e.g. via the REST API).
+    pub fn from_cells(cells: &[(Pos, Player)], total_moves: u32) -> Self {
+        let board: HashMap<Pos, Player> = cells.iter().copied().collect();
+        let mut state = GameState {
+            candidates: HashSet::new(),
+            total_moves,
+            winner: None,
+            board,
+        };
+        let positions: Vec<Pos> = state.board.keys().copied().collect();
+        for pos in positions {
+            state.expand_candidates(pos);
+        }
+        for (&pos, &player) in &state.board {
+            if check_win(&state.board, pos, player) {
+                state.winner = Some(player);
+                break;
+            }
+        }
+        state
+    }
+
     /// Legal moves: origin only on an empty board; otherwise all candidate cells.
     pub fn legal_actions(&self) -> Vec<Pos> {
         if self.winner.is_some() {

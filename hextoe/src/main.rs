@@ -1,3 +1,4 @@
+use hextoe::api::{start_api_server, GameUpdate};
 use hextoe::device::default_inference_device;
 use hextoe::game::{winning_line, GameState, Player, Pos};
 use hextoe::mcts::{Mcts, RandomRollout};
@@ -68,12 +69,15 @@ struct App {
     last_pos: Option<Pos>,
     pan_offset: egui::Vec2,
     rollout_mode: RolloutMode,
+    /// Receives game state updates from the REST API (bookmarklet).
+    api_rx: Receiver<GameUpdate>,
 }
 
 impl App {
     fn new() -> Self {
         let nn_checkpoint_hint = default_inference_checkpoint_path().is_some();
         let nnue_checkpoint_hint = std::path::Path::new(DEFAULT_NNUE_PATH).exists();
+        let api_rx = start_api_server();
         let mut app = App {
             game: GameState::new(),
             nn_checkpoint_hint,
@@ -91,6 +95,7 @@ impl App {
             } else {
                 RolloutMode::Random
             },
+            api_rx,
         };
         app.restart_mcts();
         app
@@ -349,6 +354,26 @@ impl eframe::App for App {
                 self.mcts_iters = iters;
             }
             ctx.request_repaint(); // keep polling every frame
+        }
+
+        // Drain REST API updates from the bookmarklet.
+        while let Ok(update) = self.api_rx.try_recv() {
+            match update {
+                GameUpdate::Reset(state) => {
+                    self.game = state;
+                    self.last_pos = None;
+                    self.suggestions.clear();
+                    self.restart_mcts();
+                }
+                GameUpdate::Move(pos) => {
+                    if self.game.place(pos) {
+                        self.last_pos = Some(pos);
+                        self.suggestions.clear();
+                        self.restart_mcts();
+                    }
+                }
+            }
+            ctx.request_repaint();
         }
 
         // ── Side panel ────────────────────────────────────────────────────
