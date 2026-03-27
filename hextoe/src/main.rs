@@ -16,7 +16,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::Instant;
 
-const HEX_SIZE: f32 = 32.0;
+const HEX_SIZE_DEFAULT: f32 = 32.0;
 /// Iterations per batch sent by the background thread.
 const BATCH_SIZE: u32 = 300;
 
@@ -69,7 +69,10 @@ struct App {
     result_rx: Option<Receiver<(Vec<(Pos, f32, u32, f32)>, u32)>>,
     last_pos: Option<Pos>,
     pan_offset: egui::Vec2,
+    hex_size: f32,
     rollout_mode: RolloutMode,
+    /// True once the REST API has sent at least one game update; disables board clicks.
+    online_mode: bool,
     /// Receives game state updates from the REST API (bookmarklet).
     api_rx: Receiver<GameUpdate>,
     /// When the last API message arrived (for the activity flash).
@@ -93,6 +96,7 @@ impl App {
             result_rx: None,
             last_pos: None,
             pan_offset: egui::Vec2::ZERO,
+            hex_size: HEX_SIZE_DEFAULT,
             rollout_mode: if nnue_checkpoint_hint {
                 RolloutMode::Nnue
             } else if nn_checkpoint_hint {
@@ -103,6 +107,7 @@ impl App {
             api_rx,
             last_api_msg: None,
             last_save: None,
+            online_mode: false,
         };
         app.restart_mcts();
         app
@@ -190,6 +195,7 @@ impl App {
         self.suggestions.clear();
         self.last_pos = None;
         self.pan_offset = egui::Vec2::ZERO;
+        self.online_mode = false;
         self.restart_mcts();
     }
 }
@@ -371,9 +377,11 @@ impl eframe::App for App {
                     self.game = state;
                     self.last_pos = None;
                     self.suggestions.clear();
+                    self.online_mode = true;
                     self.restart_mcts();
                 }
                 GameUpdate::Move(pos) => {
+                    self.online_mode = true;
                     if self.game.place(pos) {
                         self.last_pos = Some(pos);
                         self.suggestions.clear();
@@ -545,8 +553,22 @@ impl eframe::App for App {
 
                 ui.add_space(4.0);
                 ui.label(RichText::new("Controls").strong());
-                ui.label("• Click to place a piece");
-                ui.label("• Drag to pan the board");
+                if self.online_mode {
+                    ui.label(
+                        RichText::new("• Synced from online game")
+                            .size(11.0)
+                            .color(Color32::from_rgb(100, 220, 140)),
+                    );
+                    ui.label(
+                        RichText::new("• Clicks disabled (use New Game to go local)")
+                            .size(11.0)
+                            .color(Color32::from_gray(150)),
+                    );
+                } else {
+                    ui.label("• Click to place a piece");
+                }
+                ui.label("• Drag or scroll to pan");
+                ui.label("• Pinch to zoom");
 
                 ui.add_space(10.0);
                 ui.separator();
