@@ -6,7 +6,7 @@
 ///   enumeration never rescans the full board.
 /// - Rewards are stored from a fixed root-player perspective, avoiding
 ///   per-level sign bookkeeping that breaks for 2-moves-per-turn games.
-use crate::game::{max_run_through, runs_per_axis, GameState, Player, Pos};
+use crate::game::{runs_per_axis, GameState, Player, Pos};
 use rand::Rng;
 use rayon::prelude::*;
 

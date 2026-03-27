@@ -28,7 +28,7 @@ use candle_nn::{linear, Linear, Module, VarBuilder, VarMap};
 use rand::Rng;
 
 use crate::encode::board_center;
-use crate::game::{GameState, Player, Pos};
+use crate::game::{max_run_through, GameState, Player, Pos};
 use crate::mcts::{move_weight, RolloutPolicy};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -302,16 +302,9 @@ impl RolloutPolicy for NNUERollout {
     }
 
     /// Return threat-weighted priors so PUCT focuses the search budget on the
-    /// most tactically relevant moves first.
-    ///
-    /// Priority ladder (weight → prior after normalisation):
-    ///   100 — I can win right now
-    ///    80 — opponent can win right now (must block)
-    ///    20 — extends my run to 5
-    ///    15 — blocks opponent's 5-in-a-row
-    ///     5 — extends my run to 4
-    ///     4 — blocks opponent's 4-in-a-row
-    ///     1 — normal move
+    /// most tactically relevant moves first.  Uses the shared [`move_weight`]
+    /// function which detects both linear runs and multi-axis threats (Triangle /
+    /// Rhombus formations from Hex Tac-Toe theory).
     fn priors_only(&self, state: &GameState) -> Option<Vec<(Pos, f32)>> {
         let actions = state.legal_actions();
         if actions.is_empty() {
@@ -322,26 +315,7 @@ impl RolloutPolicy for NNUERollout {
 
         let raw: Vec<(Pos, f32)> = actions
             .iter()
-            .map(|&pos| {
-                let my_run = max_run_through(&state.board, pos, me);
-                let op_run = max_run_through(&state.board, pos, opp);
-                let w = if my_run >= 6 {
-                    100.0
-                } else if op_run >= 6 {
-                    80.0
-                } else if my_run >= 5 {
-                    20.0
-                } else if op_run >= 5 {
-                    15.0
-                } else if my_run >= 4 {
-                    5.0
-                } else if op_run >= 4 {
-                    4.0
-                } else {
-                    1.0
-                };
-                (pos, w)
-            })
+            .map(|&pos| (pos, move_weight(&state.board, pos, me, opp)))
             .collect();
 
         let total: f32 = raw.iter().map(|(_, w)| w).sum();
