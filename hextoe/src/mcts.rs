@@ -6,7 +6,7 @@
 ///   enumeration never rescans the full board.
 /// - Rewards are stored from a fixed root-player perspective, avoiding
 ///   per-level sign bookkeeping that breaks for 2-moves-per-turn games.
-use crate::game::{GameState, Player, Pos};
+use crate::game::{max_run_through, GameState, Player, Pos};
 use rand::Rng;
 use rayon::prelude::*;
 
@@ -88,6 +88,48 @@ fn rollout_pick_action(
 }
 
 impl RolloutPolicy for RandomRollout {
+    /// Same threat-weighted priors as [`NNUERollout`] so interactive play with
+    /// random rollouts also blocks/attacks correctly.
+    fn priors_only(&self, state: &GameState) -> Option<Vec<(Pos, f32)>> {
+        let actions = state.legal_actions();
+        if actions.is_empty() {
+            return None;
+        }
+        let me = state.current_player();
+        let opp = me.other();
+        let raw: Vec<(Pos, f32)> = actions
+            .iter()
+            .map(|&pos| {
+                let my_run = max_run_through(&state.board, pos, me);
+                let op_run = max_run_through(&state.board, pos, opp);
+                let w = if my_run >= 6 {
+                    100.0
+                } else if op_run >= 6 {
+                    80.0
+                } else if my_run >= 5 {
+                    20.0
+                } else if op_run >= 5 {
+                    15.0
+                } else if my_run >= 4 {
+                    5.0
+                } else if op_run >= 4 {
+                    4.0
+                } else {
+                    1.0
+                };
+                (pos, w)
+            })
+            .collect();
+        // Only return priors when there are notable threats — otherwise let UCB1 handle it.
+        // This avoids paying the scan cost on every node when the position is calm.
+        let max_w = raw.iter().map(|(_, w)| *w).fold(0.0f32, f32::max);
+        if max_w <= 1.0 {
+            return None; // all moves equal weight → let UCB1 do its thing
+        }
+        let total: f32 = raw.iter().map(|(_, w)| w).sum();
+        Some(raw.into_iter().map(|(p, w)| (p, w / total)).collect())
+    }
+
     fn rollout(&self, mut state: GameState, root_player: Player, rng: &mut impl Rng) -> (f32, Option<Vec<(Pos, f32)>>) {
         let mut ply = 0u32;
         let mut x_hist = LastTwoMoves::default();

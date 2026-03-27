@@ -28,8 +28,8 @@ use candle_nn::{linear, Linear, Module, VarBuilder, VarMap};
 use rand::Rng;
 
 use crate::encode::board_center;
-use crate::game::{GameState, Player, Pos};
-use crate::mcts::{RolloutPolicy};
+use crate::game::{max_run_through, GameState, Player, Pos};
+use crate::mcts::RolloutPolicy;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -281,7 +281,71 @@ impl RolloutPolicy for NNUERollout {
             };
             return (v, None);
         }
+
+        let me = state.current_player();
+        let opp = me.other();
+
+        // If the player to move has an immediate win, they will take it.
+        if state.candidates.iter().any(|&p| max_run_through(&state.board, p, me) >= 6) {
+            let v = if me == root_player { 0.98 } else { -0.98 };
+            return (v, None);
+        }
+
+        // If opponent has an immediate winning threat (we'll face it on their next turn),
+        // the position is already very bad regardless of what we do.
+        if state.candidates.iter().any(|&p| max_run_through(&state.board, p, opp) >= 6) {
+            let v = if opp == root_player { 0.75 } else { -0.75 };
+            return (v, None);
+        }
+
         (self.eval_state(&state, root_player), None)
+    }
+
+    /// Return threat-weighted priors so PUCT focuses the search budget on the
+    /// most tactically relevant moves first.
+    ///
+    /// Priority ladder (weight → prior after normalisation):
+    ///   100 — I can win right now
+    ///    80 — opponent can win right now (must block)
+    ///    20 — extends my run to 5
+    ///    15 — blocks opponent's 5-in-a-row
+    ///     5 — extends my run to 4
+    ///     4 — blocks opponent's 4-in-a-row
+    ///     1 — normal move
+    fn priors_only(&self, state: &GameState) -> Option<Vec<(Pos, f32)>> {
+        let actions = state.legal_actions();
+        if actions.is_empty() {
+            return None;
+        }
+        let me = state.current_player();
+        let opp = me.other();
+
+        let raw: Vec<(Pos, f32)> = actions
+            .iter()
+            .map(|&pos| {
+                let my_run = max_run_through(&state.board, pos, me);
+                let op_run = max_run_through(&state.board, pos, opp);
+                let w = if my_run >= 6 {
+                    100.0
+                } else if op_run >= 6 {
+                    80.0
+                } else if my_run >= 5 {
+                    20.0
+                } else if op_run >= 5 {
+                    15.0
+                } else if my_run >= 4 {
+                    5.0
+                } else if op_run >= 4 {
+                    4.0
+                } else {
+                    1.0
+                };
+                (pos, w)
+            })
+            .collect();
+
+        let total: f32 = raw.iter().map(|(_, w)| w).sum();
+        Some(raw.into_iter().map(|(p, w)| (p, w / total)).collect())
     }
 
     /// Pure CPU + `Arc` → safe to call from multiple threads at once.

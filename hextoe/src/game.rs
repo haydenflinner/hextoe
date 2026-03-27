@@ -141,6 +141,21 @@ fn count_axis(board: &HashMap<Pos, Player>, pos: Pos, player: Player, dq: i32, d
     count
 }
 
+/// Maximum consecutive `player` run through `pos` across all three axes,
+/// treating `pos` as if occupied by `player` (regardless of its actual state).
+///
+/// Use this to evaluate "how good would it be to place at `pos`?":
+/// - returns ≥ 6 → placing here wins immediately
+/// - returns 5 → extends to a 5-in-a-row (one step from winning)
+/// - returns 4 → extends to a 4-in-a-row, etc.
+pub fn max_run_through(board: &HashMap<Pos, Player>, pos: Pos, player: Player) -> u32 {
+    WIN_AXES
+        .iter()
+        .map(|&(dq, dr)| count_axis(board, pos, player, dq, dr) + 1)
+        .max()
+        .unwrap_or(0)
+}
+
 pub fn check_win(board: &HashMap<Pos, Player>, pos: Pos, player: Player) -> bool {
     WIN_AXES
         .iter()
