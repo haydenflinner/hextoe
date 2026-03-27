@@ -1,8 +1,9 @@
 //! Supervised pre-training of the NNUE value network from online game data (JSON).
 //!
 //! Usage:
-//!   hextoe-pretrain-nnue <games.json> [--epochs N] [--batch-size B] [--lr LR] [--out path]
+//!   hextoe-pretrain-nnue <games1.json> [games2.json ...] [--epochs N] [--batch-size B] [--lr LR] [--out path]
 //!
+//! Accepts one or more JSON files (pass a shell glob and the shell will expand it).
 //! Trains only the value head (MSE loss). The NNUE has no policy head.
 //! Typical workflow: run this once on human game data before self-play to give
 //! the value network a warm start, then let the self-play loop keep it updated.
@@ -18,33 +19,38 @@ use rand::SeedableRng;
 
 use hextoe::nnue::{build_nnue_model, DEFAULT_NNUE_PATH};
 use hextoe::self_play::GameRecord;
-use hextoe::supervised::load_supervised_records;
+use hextoe::supervised::load_supervised_records_multi;
 use hextoe::train::nnue_train_step;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 || args[1].starts_with('-') {
         eprintln!(
-            "Usage: hextoe-pretrain-nnue <games.json> [--epochs N] [--batch-size B] [--lr LR] [--out path]"
+            "Usage: hextoe-pretrain-nnue <games1.json> [games2.json ...] [--epochs N] [--batch-size B] [--lr LR] [--out path]"
         );
         std::process::exit(1);
     }
 
-    let json_path = &args[1];
+    // Collect positional args (everything before the first --flag).
+    let json_paths: Vec<String> = args[1..]
+        .iter()
+        .take_while(|a| !a.starts_with('-'))
+        .cloned()
+        .collect();
     let epochs = parse_arg(&args, "--epochs", 300usize);
     let batch_size = parse_arg(&args, "--batch-size", 256usize);
     let lr = parse_arg_f64(&args, "--lr", 1e-3);
     let out_path = parse_arg_str(&args, "--out", DEFAULT_NNUE_PATH);
 
-    println!("Loading game data from {json_path} …");
-    let (records, used, skipped) = match load_supervised_records(json_path) {
+    println!("Loading game data from {} file(s)…", json_paths.len());
+    let (records, used, skipped) = match load_supervised_records_multi(&json_paths) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("Error loading games: {e}");
             std::process::exit(1);
         }
     };
-    println!("  {} games used, {} skipped → {} positions", used, skipped, records.len());
+    println!("Total: {} games used, {} skipped → {} positions", used, skipped, records.len());
 
     // Check NNUE coverage.
     let nnue_count = records.iter().filter(|r| !r.nnue_feats.is_empty()).count();

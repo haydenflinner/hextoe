@@ -1,8 +1,9 @@
 //! Supervised pre-training from online game data (JSON).
 //!
 //! Usage:
-//!   hextoe-pretrain <games.json> [--epochs N] [--batch-size B] [--lr LR] [--out path]
+//!   hextoe-pretrain <games1.json> [games2.json ...] [--epochs N] [--batch-size B] [--lr LR] [--out path]
 //!
+//! Accepts one or more JSON files (pass a shell glob and the shell will expand it).
 //! Loads human game records, trains the dual-head network on them (value head learns
 //! win/loss, policy head learns to predict human moves), and saves the result.
 //! Run this once before self-play training to give the network a warm start.
@@ -18,29 +19,34 @@ use rand::SeedableRng;
 use hextoe::device::default_inference_device;
 use hextoe::nn::build_model;
 use hextoe::self_play::GameRecord;
-use hextoe::supervised::load_supervised_records;
+use hextoe::supervised::load_supervised_records_multi;
 use hextoe::train::{train_step, DEFAULT_BEST_PATH, DEFAULT_LATEST_PATH};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 || args[1].starts_with('-') {
-        eprintln!("Usage: hextoe-pretrain <games.json> [--epochs N] [--batch-size B] [--lr LR] [--out path]");
+        eprintln!("Usage: hextoe-pretrain <games1.json> [games2.json ...] [--epochs N] [--batch-size B] [--lr LR] [--out path]");
         std::process::exit(1);
     }
 
-    let json_path = &args[1];
+    // Collect positional args (everything before the first --flag).
+    let json_paths: Vec<String> = args[1..]
+        .iter()
+        .take_while(|a| !a.starts_with('-'))
+        .cloned()
+        .collect();
     let epochs = parse_arg(&args, "--epochs", 200usize);
     let batch_size = parse_arg(&args, "--batch-size", 128usize);
     let lr = parse_arg_f64(&args, "--lr", 3e-4);
     let out_path = parse_arg_str(&args, "--out", DEFAULT_BEST_PATH);
 
-    println!("Loading game data from {json_path} ...");
-    let (records, used, skipped) = match load_supervised_records(json_path) {
+    println!("Loading game data from {} file(s)…", json_paths.len());
+    let (records, used, skipped) = match load_supervised_records_multi(&json_paths) {
         Ok(x) => x,
         Err(e) => { eprintln!("Error loading games: {e}"); std::process::exit(1); }
     };
     println!(
-        "  {} games used, {} skipped → {} positions",
+        "Total: {} games used, {} skipped → {} positions",
         used, skipped, records.len()
     );
     if records.is_empty() {

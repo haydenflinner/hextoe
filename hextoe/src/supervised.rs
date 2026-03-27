@@ -48,6 +48,25 @@ struct GamesFile {
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
+/// Load one or more JSON files and merge into a single record list.
+///
+/// Prints a per-file summary to stdout. Returns `(records, total_used, total_skipped)`.
+pub fn load_supervised_records_multi(
+    paths: &[String],
+) -> Result<(Vec<GameRecord>, usize, usize), Box<dyn std::error::Error>> {
+    let mut all_records = Vec::new();
+    let mut total_used = 0usize;
+    let mut total_skipped = 0usize;
+    for path in paths {
+        let (records, used, skipped) = load_supervised_records(path)?;
+        println!("  {path}: {used} games used, {skipped} skipped → {} positions", records.len());
+        all_records.extend(records);
+        total_used += used;
+        total_skipped += skipped;
+    }
+    Ok((all_records, total_used, total_skipped))
+}
+
 /// Load a JSON file of online games and return [`GameRecord`]s ready for training.
 ///
 /// Each position in each accepted game becomes one record:
