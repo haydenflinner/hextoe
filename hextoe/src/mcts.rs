@@ -6,7 +6,7 @@
 ///   enumeration never rescans the full board.
 /// - Rewards are stored from a fixed root-player perspective, avoiding
 ///   per-level sign bookkeeping that breaks for 2-moves-per-turn games.
-use crate::game::{max_run_through, GameState, Player, Pos};
+use crate::game::{max_run_through, runs_per_axis, GameState, Player, Pos};
 use rand::Rng;
 use rayon::prelude::*;
 
@@ -42,6 +42,58 @@ pub trait RolloutPolicy {
     /// If true, root-parallel search may use an equivalent stateless rollout
     /// ([`RandomRollout`] only). Other policies always run serially.
     const PARALLEL_SAFE: bool = false;
+}
+
+/// Tactical weight for placing at `pos` when `me` is to move.
+///
+/// Priority ladder:
+///   100 — immediate win
+///    80 — must block opponent's immediate win
+///    20 — extends my run to 5
+///    15 — blocks opponent's 5-in-a-row
+///    12 — creates threats on 2+ axes (Triangle / Rhombus multi-axis attack)
+///    10 — blocks opponent's 2+-axis threat
+///     5 — extends my run to 4
+///     4 — blocks opponent's 4-in-a-row
+///     3 — creates a 3-in-a-row on any axis
+///   2.5 — blocks opponent's 3-in-a-row
+///     1 — normal move
+pub(crate) fn move_weight(
+    board: &std::collections::HashMap<crate::game::Pos, crate::game::Player>,
+    pos: crate::game::Pos,
+    me: crate::game::Player,
+    opp: crate::game::Player,
+) -> f32 {
+    let my_runs = runs_per_axis(board, pos, me);
+    let op_runs = runs_per_axis(board, pos, opp);
+    let my_max = my_runs.iter().copied().max().unwrap_or(0);
+    let op_max = op_runs.iter().copied().max().unwrap_or(0);
+    let my_axes3 = my_runs.iter().filter(|&&r| r >= 3).count();
+    let op_axes3 = op_runs.iter().filter(|&&r| r >= 3).count();
+
+    if my_max >= 6 {
+        100.0
+    } else if op_max >= 6 {
+        80.0
+    } else if my_max >= 5 {
+        20.0
+    } else if op_max >= 5 {
+        15.0
+    } else if my_axes3 >= 2 {
+        12.0
+    } else if op_axes3 >= 2 {
+        10.0
+    } else if my_max >= 4 {
+        5.0
+    } else if op_max >= 4 {
+        4.0
+    } else if my_axes3 >= 1 {
+        3.0
+    } else if op_axes3 >= 1 {
+        2.5
+    } else {
+        1.0
+    }
 }
 
 /// Uniform random playouts (used by the GUI and benchmarks).
@@ -99,26 +151,7 @@ impl RolloutPolicy for RandomRollout {
         let opp = me.other();
         let raw: Vec<(Pos, f32)> = actions
             .iter()
-            .map(|&pos| {
-                let my_run = max_run_through(&state.board, pos, me);
-                let op_run = max_run_through(&state.board, pos, opp);
-                let w = if my_run >= 6 {
-                    100.0
-                } else if op_run >= 6 {
-                    80.0
-                } else if my_run >= 5 {
-                    20.0
-                } else if op_run >= 5 {
-                    15.0
-                } else if my_run >= 4 {
-                    5.0
-                } else if op_run >= 4 {
-                    4.0
-                } else {
-                    1.0
-                };
-                (pos, w)
-            })
+            .map(|&pos| (pos, move_weight(&state.board, pos, me, opp)))
             .collect();
         // Only return priors when there are notable threats — otherwise let UCB1 handle it.
         // This avoids paying the scan cost on every node when the position is calm.

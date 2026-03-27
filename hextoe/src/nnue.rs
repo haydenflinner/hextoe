@@ -28,8 +28,8 @@ use candle_nn::{linear, Linear, Module, VarBuilder, VarMap};
 use rand::Rng;
 
 use crate::encode::board_center;
-use crate::game::{max_run_through, GameState, Player, Pos};
-use crate::mcts::RolloutPolicy;
+use crate::game::{GameState, Player, Pos};
+use crate::mcts::{move_weight, RolloutPolicy};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
