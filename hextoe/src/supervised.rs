@@ -12,6 +12,7 @@ use serde::Deserialize;
 
 use crate::encode::{action_to_index, board_center, encode_state, CHANNELS, GRID};
 use crate::game::{GameState, Player};
+use crate::nnue::encode_nnue;
 use crate::self_play::GameRecord;
 
 // ── JSON schema ───────────────────────────────────────────────────────────────
@@ -104,7 +105,8 @@ fn process_game(game: &GameJson) -> Option<Vec<GameRecord>> {
     // Replay the game, recording (state_enc, pi, current_player) at each move.
     let mut state = GameState::new();
     // steps: (state_enc, pi, player_to_move)
-    let mut steps: Vec<([f32; CHANNELS * GRID * GRID], [f32; GRID * GRID], Player)> = Vec::new();
+    let mut steps: Vec<([f32; CHANNELS * GRID * GRID], [f32; GRID * GRID], Player, Vec<u16>)> =
+        Vec::new();
 
     for m in &moves {
         if state.is_terminal() {
@@ -120,7 +122,9 @@ fn process_game(game: &GameJson) -> Option<Vec<GameRecord>> {
         if let Some(idx) = action_to_index(pos, center) {
             pi[idx] = 1.0;
             let state_enc = encode_state(&state);
-            steps.push((state_enc, pi, current_player));
+            let nnue_feats: Vec<u16> =
+                encode_nnue(&state, center).into_iter().map(|f| f as u16).collect();
+            steps.push((state_enc, pi, current_player, nnue_feats));
         }
         // Whether or not we recorded this step, always advance the game state.
         if !state.place(pos) {
@@ -137,12 +141,13 @@ fn process_game(game: &GameJson) -> Option<Vec<GameRecord>> {
     Some(
         steps
             .into_iter()
-            .map(|(state_enc, pi, player)| {
+            .map(|(state_enc, pi, player, nnue_feats)| {
                 let outcome = if player == winner_player { 1.0f32 } else { -1.0f32 };
                 GameRecord {
                     state_enc: Box::new(state_enc),
                     pi: Box::new(pi),
                     outcome,
+                    nnue_feats,
                 }
             })
             .collect(),

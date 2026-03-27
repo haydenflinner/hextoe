@@ -3,6 +3,8 @@ pub mod encode;
 pub mod game;
 pub mod mcts;
 pub mod nn;
+pub mod nnue;
 pub mod self_play;
+pub mod symmetry;
 pub mod train;
 pub mod supervised;

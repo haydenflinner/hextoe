@@ -7,6 +7,7 @@ use crate::encode::{action_to_index, board_center, encode_state, CHANNELS, GRID}
 use crate::game::{GameState, Player, Pos};
 use crate::mcts::{Mcts, RolloutPolicy, MAX_GAME_MOVES};
 use crate::nn::{DualNetRollout, HextoeNet};
+use crate::nnue::encode_nnue;
 
 // ── Data structures ───────────────────────────────────────────────────────────
 
@@ -19,6 +20,9 @@ pub struct GameRecord {
     /// Game outcome from the perspective of the player to move at this position:
     /// +1.0 = win, -1.0 = loss, 0.0 = draw.
     pub outcome: f32,
+    /// NNUE sparse feature indices (u16; fits since N_FEATURES < 65536).
+    /// Empty only for records loaded from pre-NNUE checkpoints.
+    pub nnue_feats: Vec<u16>,
 }
 
 // ── Replay buffer ─────────────────────────────────────────────────────────────
@@ -122,8 +126,8 @@ impl SelfPlayCollector {
         F: FnMut(u32, Duration),
     {
         let mut state = GameState::new();
-        // Temporary storage: (encoded_state, pi, player_to_move)
-        let mut steps: Vec<([f32; CHANNELS * GRID * GRID], [f32; GRID * GRID], Player)> =
+        // Temporary storage: (encoded_state, pi, player_to_move, nnue_feats)
+        let mut steps: Vec<([f32; CHANNELS * GRID * GRID], [f32; GRID * GRID], Player, Vec<u16>)> =
             Vec::new();
         let mut move_count = 0u32;
 
@@ -139,6 +143,8 @@ impl SelfPlayCollector {
             let state_enc = encode_state(&state);
             let center = board_center(&state);
             let current_player = state.current_player();
+            let nnue_feats: Vec<u16> =
+                encode_nnue(&state, center).into_iter().map(|f| f as u16).collect();
 
             // ----- run MCTS -----
             let mut mcts = Mcts::new(state.clone());
@@ -180,7 +186,7 @@ impl SelfPlayCollector {
                 chosen
             };
 
-            steps.push((state_enc, pi, current_player));
+            steps.push((state_enc, pi, current_player, nnue_feats));
             state.place(chosen_pos);
             move_count += 1;
         }
@@ -191,7 +197,7 @@ impl SelfPlayCollector {
         let winner = state.winner;
         steps
             .into_iter()
-            .map(|(state_enc, pi, player)| {
+            .map(|(state_enc, pi, player, nnue_feats)| {
                 let outcome = match winner {
                     Some(w) if w == player => 1.0,
                     Some(_) => -1.0,
@@ -201,6 +207,7 @@ impl SelfPlayCollector {
                     state_enc: Box::new(state_enc),
                     pi: Box::new(pi),
                     outcome,
+                    nnue_feats,
                 }
             })
             .collect()
