@@ -74,6 +74,8 @@ struct App {
     api_rx: Receiver<GameUpdate>,
     /// When the last API message arrived (for the activity flash).
     last_api_msg: Option<Instant>,
+    /// Most recently saved game file path + when it was saved.
+    last_save: Option<(Instant, String)>,
 }
 
 impl App {
@@ -100,6 +102,7 @@ impl App {
             },
             api_rx,
             last_api_msg: None,
+            last_save: None,
         };
         app.restart_mcts();
         app
@@ -377,6 +380,9 @@ impl eframe::App for App {
                         self.restart_mcts();
                     }
                 }
+                GameUpdate::Saved(path) => {
+                    self.last_save = Some((Instant::now(), path));
+                }
             }
             ctx.request_repaint();
         }
@@ -561,7 +567,6 @@ impl eframe::App for App {
                         (Color32::from_rgb(30, 80, 50), "API: listening :8080")
                     };
                     ui.horizontal(|ui| {
-                        // Filled circle as activity dot.
                         let (rect, _) = ui.allocate_exact_size(
                             egui::vec2(10.0, 10.0),
                             egui::Sense::hover(),
@@ -569,9 +574,28 @@ impl eframe::App for App {
                         ui.painter().circle_filled(rect.center(), 5.0, dot_col);
                         ui.label(RichText::new(label).size(11.0).color(dot_col));
                     });
-                    // Keep repainting while the flash is still fading.
                     if age < FADE_SECS {
                         ctx.request_repaint();
+                    }
+
+                    // Save notification — fades over 5 s.
+                    const SAVE_FADE: f32 = 5.0;
+                    if let Some((saved_at, ref path)) = self.last_save {
+                        let save_age = saved_at.elapsed().as_secs_f32();
+                        if save_age < SAVE_FADE {
+                            let t = 1.0 - (save_age / SAVE_FADE);
+                            let alpha = (220.0 * t) as u8;
+                            let short = std::path::Path::new(path)
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or(path.as_str());
+                            ui.label(
+                                RichText::new(format!("Saved: {short}"))
+                                    .size(11.0)
+                                    .color(Color32::from_rgba_unmultiplied(100, 220, 140, alpha)),
+                            );
+                            ctx.request_repaint();
+                        }
                     }
                 }
 
