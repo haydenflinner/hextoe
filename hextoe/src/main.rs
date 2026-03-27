@@ -7,7 +7,8 @@ use hextoe::train::default_inference_checkpoint_path;
 
 use candle_core::Device as CandleDevice;
 use eframe::egui;
-use egui::{Color32, FontId, Pos2, RichText, Stroke};
+use egui::text::{Galley, LayoutJob};
+use egui::{Align, Color32, FontId, Pos2, RichText, Stroke};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
@@ -221,6 +222,70 @@ fn hex_corners(centre: Pos2, size: f32) -> [Pos2; 6] {
         let angle = std::f32::consts::FRAC_PI_6 + std::f32::consts::FRAC_PI_3 * i as f32;
         Pos2::new(centre.x + size * angle.cos(), centre.y + size * angle.sin())
     })
+}
+
+/// Horizontal half-width available for text at vertical offset `dy` from hex centre
+/// (positive `dy` = downward). `r` is the same circumradius as `hex_corners(_, r)`.
+fn hex_max_text_half_width(r: f32, dy: f32) -> f32 {
+    let abs_y = dy.abs();
+    if abs_y <= r * 0.5 {
+        r * 3f32.sqrt() * 0.5
+    } else if abs_y <= r {
+        (r - abs_y) * 3f32.sqrt()
+    } else {
+        0.0
+    }
+}
+
+fn layout_centered_suggestion_galley(
+    painter: &egui::Painter,
+    text: String,
+    font_id: FontId,
+) -> Arc<Galley> {
+    let mut job = LayoutJob::simple(text, font_id, Color32::BLACK, f32::INFINITY);
+    job.halign = Align::Center;
+    painter.layout_job(job)
+}
+
+/// Shrink font until each row fits the hex width at that height and the block fits vertically.
+fn fit_suggestion_galley_in_hex(
+    painter: &egui::Painter,
+    text: String,
+    r: f32,
+    initial_font_px: f32,
+) -> (f32, Arc<Galley>) {
+    const MIN_FONT: f32 = 4.0;
+    const MARGIN: f32 = 0.90;
+    const MAX_ITERS: usize = 10;
+
+    let mut font_size = initial_font_px;
+    for _ in 0..MAX_ITERS {
+        let font_id = FontId::proportional(font_size);
+        let galley = layout_centered_suggestion_galley(painter, text.clone(), font_id);
+        let mut scale = 1.0_f32;
+
+        let cy = galley.rect.center().y;
+        for row in &galley.rows {
+            let dy = row.rect.center().y - cy;
+            let max_w = 2.0 * hex_max_text_half_width(r, dy) * MARGIN;
+            if row.rect.width() > 0.0 && max_w > 0.0 && row.rect.width() > max_w {
+                scale = scale.min(max_w / row.rect.width());
+            }
+        }
+
+        let max_h = 2.0 * r * MARGIN;
+        if galley.rect.height() > max_h {
+            scale = scale.min(max_h / galley.rect.height());
+        }
+
+        if scale >= 0.999 {
+            return (font_size, galley);
+        }
+        font_size = (font_size * scale).max(MIN_FONT);
+    }
+    let font_id = FontId::proportional(font_size);
+    let galley = layout_centered_suggestion_galley(painter, text, font_id);
+    (font_size, galley)
 }
 
 // ── Colour helpers ────────────────────────────────────────────────────────────
@@ -543,18 +608,17 @@ impl eframe::App for App {
                     );
                 } else if let Some(&(rank, wr, visits, pol)) = suggestion_map.get(pos) {
                     let marker = ["①", "②", "③"][rank];
-                    painter.text(
-                        centre,
-                        egui::Align2::CENTER_CENTER,
-                        format!(
-                            "{marker}\n{:.0}%\n{} · {:.0}%",
-                            wr * 100.0,
-                            fmt_iters(visits),
-                            pol * 100.0
-                        ),
-                        FontId::proportional(HEX_SIZE * 0.32),
-                        Color32::BLACK,
+                    let label = format!(
+                        "{marker}\n{:.0}%\n{} · {:.0}%",
+                        wr * 100.0,
+                        fmt_iters(visits),
+                        pol * 100.0
                     );
+                    let r = HEX_SIZE - 1.5;
+                    let (_font_px, galley) =
+                        fit_suggestion_galley_in_hex(&painter, label, r, HEX_SIZE * 0.32);
+                    let draw_pos = centre - galley.rect.center().to_vec2();
+                    painter.galley(draw_pos, galley, Color32::BLACK);
                 }
             }
 
