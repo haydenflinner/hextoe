@@ -1,0 +1,43 @@
+How it works
+Transport: The game uses socket.io over WebSocket (pure WebSocket transport). The socket is stored in a module-scoped variable Ix — inaccessible from the console. So instead of hooking the socket directly, I intercept through the React fiber tree.
+Approach: Every 150ms, the script walks React's internal fiber tree to find the Zustand store's game state (the session object with id, gameState, players). It diffs the gameState.cells array to detect new moves.
+
+Data formats your bot receives
+POST /game-state — fires once when a new session is detected:
+json{
+  "event": "game-state",
+  "sessionId": "abc123",
+  "players": [{"id": "...", "displayName": "...", "elo": 1050}],
+  "data": { "state": { "cells": [...], "currentTurnPlayerId": "...", ... } }
+}
+POST /move — fires for every move placed:
+json{
+  "event": "game-cell-place",
+  "sessionId": "abc123",
+  "data": {
+    "cell": { "x": 3, "y": -1, "occupiedBy": "playerId" },
+    "state": {
+      "cells": [...all cells so far...],
+      "currentTurnPlayerId": "...",
+      "placementsRemaining": 1,
+      "playerTimeRemainingMs": { "playerId1": 250000, "playerId2": 298000 },
+      "winner": null
+    }
+  }
+}
+POST /game-over — fires when someone wins:
+json{
+  "event": "game-over",
+  "sessionId": "abc123",
+  "data": {
+    "winner": { "playerId": "...", "cells": [...winning 6-in-a-row cells...] },
+    "finalCells": [...], "players": [...]
+  }
+}
+
+Status
+✅ The interceptor is running right now (polling every 150ms). The script detected the previous expired session (pbe41j, hayden392 vs Guest BDA4) and correctly identified the winner.
+When you host and start a new match, it will automatically detect the new session and start streaming moves to http://localhost:8080.
+If the page ever fully reloads (e.g., F5), paste this into the console to re-activate it:
+javascript(function(){const B=8080,P=150;let S=null,K=new Set,G=false;function F(){for(const e of document.querySelectorAll('*')){const k=Object.keys(e).find(k=>k.startsWith('__reactFiber'));if(k)return e[k]}return null}function R(f){let c=f;while(c&&c.return)c=c.return;return c}function findSession(){const f=F();if(!f)return null;const r=R(f)?.stateNode?.current;if(!r)return null;const v=new WeakSet;let res=null;function w(n,d){if(!n||d>250||v.has(n)||res)return;try{v.add(n)}catch(e){return}try{let h=n.memoizedState,i=0;while(h&&i<30){const m=h.memoizedState;if(m&&typeof m==='object'&&!Array.isArray(m)&&m.id&&m.gameState&&m.players){res=m;return}h=h.next;i++}}catch(e){}w(n.child,d+1);w(n.sibling,d+1)}w(r,0);return res}function post(ep,data){fetch('http://localhost:'+B+ep,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)}).then(r=>console.log('[HexBot] POST '+ep+' '+r.status)).catch(()=>{})}function tick(){try{const s=findSession();if(!s){if(S){console.log('[HexBot] Left session');S=null;K=new Set;G=false}return}const{id:id,gameState:gs,players:pl}=s;const cells=gs?.cells||[];if(id!==S){S=id;K=new Set(cells.map(c=>c.x+','+c.y));G=false;console.log('[HexBot] Session:',id);post('/game-state',{event:'game-state',sessionId:id,players:pl,data:{state:gs}});return}cells.forEach(c=>{const k=c.x+','+c.y;if(!K.has(k)){K.add(k);console.log('[HexBot] Move:',c.x,c.y,'by',c.occupiedBy);post('/move',{event:'game-cell-place',sessionId:id,data:{sessionId:id,cell:c,state:{cells,currentTurnPlayerId:gs.currentTurnPlayerId,placementsRemaining:gs.placementsRemaining,playerTimeRemainingMs:gs.playerTimeRemainingMs,currentTurnExpiresAt:gs.currentTurnExpiresAt,winner:gs.winner}}})}});if(gs?.winner&&!G){G=true;post('/game-over',{event:'game-over',sessionId:id,data:{winner:gs.winner,finalCells:cells,players:pl}})}}catch(e){}}if(window.__hexBotInterval)clearInterval(window.__hexBotInterval);window.__hexBotInterval=setInterval(tick,P);tick();console.log('[HexBot] ACTIVE → http://localhost:'+B)})();
+The coordinates use the game's axial hex coordinate system (x, y). Your bot should make sure to have CORS-permissive headers since the POSTs come from https://hexo.did.science.
