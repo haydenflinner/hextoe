@@ -634,13 +634,36 @@ impl eframe::App for App {
         // ── Board panel ───────────────────────────────────────────────────
         egui::CentralPanel::default().show(ctx, |ui| {
             let rect = ui.available_rect_before_wrap();
-            let origin = rect.center() + self.pan_offset;
 
             let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
 
+            // Drag to pan.
             if response.dragged() {
                 self.pan_offset += response.drag_delta();
             }
+
+            // Pinch-to-zoom and two-finger scroll — only when pointer is over the board.
+            if response.hovered() {
+                let zoom = ctx.input(|i| i.zoom_delta());
+                if zoom != 1.0 {
+                    let ptr = ctx.input(|i| i.pointer.hover_pos())
+                        .unwrap_or(rect.center());
+                    let old = self.hex_size;
+                    let new = (old * zoom).clamp(8.0, 120.0);
+                    let z = new / old;
+                    // Zoom toward the pointer position.
+                    self.pan_offset = (ptr - rect.center()) * (1.0 - z) + z * self.pan_offset;
+                    self.hex_size = new;
+                }
+
+                let scroll = ctx.input(|i| i.smooth_scroll_delta);
+                if scroll != egui::Vec2::ZERO {
+                    self.pan_offset += scroll;
+                }
+            }
+
+            let hs = self.hex_size;
+            let origin = rect.center() + self.pan_offset;
 
             // Determine winning line.
             let win_cells: std::collections::HashSet<Pos> =
@@ -677,22 +700,22 @@ impl eframe::App for App {
             let painter = ui.painter_at(rect);
 
             let hovered = ctx.pointer_hover_pos().and_then(|p| {
-                if rect.contains(p) && !self.game.is_terminal() {
-                    Some(pixel_to_hex(p, HEX_SIZE, origin))
+                if rect.contains(p) && !self.game.is_terminal() && !self.online_mode {
+                    Some(pixel_to_hex(p, hs, origin))
                 } else {
                     None
                 }
             });
 
-            let expanded = rect.expand(HEX_SIZE * 3.0);
+            let expanded = rect.expand(hs * 3.0);
             for pos in &cells {
-                let centre = hex_to_pixel(pos.0, pos.1, HEX_SIZE, origin);
+                let centre = hex_to_pixel(pos.0, pos.1, hs, origin);
                 if !expanded.contains(centre) {
                     continue;
                 }
 
                 let sug_rank = suggestion_map.get(pos).map(|&(r, _, _, _)| r);
-                let corners: Vec<Pos2> = hex_corners(centre, HEX_SIZE - 1.5).into();
+                let corners: Vec<Pos2> = hex_corners(centre, hs - 1.5).into();
                 let fill = cell_fill(*pos, &self.game, &win_cells, sug_rank, hovered);
                 let stroke_col = if win_cells.contains(pos) {
                     Color32::YELLOW
@@ -717,18 +740,18 @@ impl eframe::App for App {
                         fmt_iters(visits),
                         pol * 100.0
                     );
-                    let r = HEX_SIZE - 1.5;
+                    let r = hs - 1.5;
                     let (_font_px, galley) =
-                        fit_suggestion_galley_in_hex(&painter, label, r, HEX_SIZE * 0.32);
+                        fit_suggestion_galley_in_hex(&painter, label, r, hs * 0.32);
                     let draw_pos = centre - galley.rect.center().to_vec2();
                     painter.galley(draw_pos, galley, Color32::BLACK);
                 }
             }
 
-            // Handle click.
-            if response.clicked() {
+            // Handle click — disabled in online mode.
+            if !self.online_mode && response.clicked() {
                 if let Some(click) = response.interact_pointer_pos() {
-                    self.handle_click(pixel_to_hex(click, HEX_SIZE, origin));
+                    self.handle_click(pixel_to_hex(click, hs, origin));
                 }
             }
         });
