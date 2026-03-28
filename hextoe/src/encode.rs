@@ -1,6 +1,8 @@
 use crate::game::{GameState, Player, Pos};
 
-pub const GRID: usize = 21;
+/// Side length of the square crop centred on the board centroid used for CNN input/output.
+/// Radius = (GRID-1)/2 = 16 hexes from centre — covers >99% of competitive play.
+pub const GRID: usize = 33;
 pub const CHANNELS: usize = 4;
 
 /// Return the rounded mean (q, r) of all board piece positions.

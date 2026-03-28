@@ -1,22 +1,28 @@
 /// AlphaZero-style combined policy+value network for Hextoe.
 ///
 /// Architecture:
-///   trunk  : Conv(4→64, 3×3) + ReLU, then 4 residual blocks (64 ch)
-///   policy : Conv(64→2, 1×1) + ReLU → flatten → Linear(2·G²→G²)  (logits)
-///   value  : Conv(64→1, 1×1) + ReLU → flatten → Linear(G²→256) + ReLU
+///   trunk  : Conv(4→128, 3×3) + BN + ReLU, then 8 residual blocks (128 ch)
+///            Each residual block: Conv(128→128, 3×3) + BN + ReLU + Conv + BN + skip + ReLU
+///   policy : Conv(128→2, 1×1) + BN + ReLU → flatten → Linear(2·G²→G²)  (logits)
+///   value  : Conv(128→1, 1×1) + BN + ReLU → flatten → Linear(G²→256) + ReLU
 ///            → Linear(256→1) + Tanh
 ///
-/// where G = encode::GRID = 21.
-use candle_core::{DType, Device, Result, Tensor};
-use candle_nn::{conv2d, linear, Conv2d, Conv2dConfig, Linear, Module, VarBuilder, VarMap};
+/// where G = encode::GRID = 33.
+///
+/// The larger grid (33×33 vs the old 21×21) covers a radius-16 window around the board
+/// centroid — sufficient for >99% of real competitive games. The deeper/wider trunk gives
+/// the network enough receptive field and capacity to reason about formations like the
+/// Island Gambit that span the full board extent.
+use candle_core::{DType, Device, ModuleT, Result, Tensor};
+use candle_nn::{batch_norm, conv2d, linear, BatchNorm, Conv2d, Conv2dConfig, Linear, Module, VarBuilder, VarMap};
 use rand::Rng;
 
 use crate::encode::{action_to_index, board_center, encode_state, index_to_action, CHANNELS, GRID};
 use crate::game::{GameState, Player, Pos};
 use crate::mcts::{RandomRollout, RolloutPolicy, MAX_GAME_MOVES};
 
-const HIDDEN: usize = 64;
-const RES_BLOCKS: usize = 4;
+const HIDDEN: usize = 128;
+const RES_BLOCKS: usize = 8;
 const POLICY_CH: usize = 2;
 const VALUE_CH: usize = 1;
 const VALUE_FC: usize = 256;
@@ -25,7 +31,9 @@ const VALUE_FC: usize = 256;
 
 struct ResBlock {
     c1: Conv2d,
+    bn1: BatchNorm,
     c2: Conv2d,
+    bn2: BatchNorm,
 }
 
 impl ResBlock {
@@ -33,13 +41,15 @@ impl ResBlock {
         let cfg = Conv2dConfig { padding: 1, ..Default::default() };
         Ok(ResBlock {
             c1: conv2d(HIDDEN, HIDDEN, 3, cfg, vb.pp("c1"))?,
+            bn1: batch_norm(HIDDEN, 1e-5, vb.pp("bn1"))?,
             c2: conv2d(HIDDEN, HIDDEN, 3, cfg, vb.pp("c2"))?,
+            bn2: batch_norm(HIDDEN, 1e-5, vb.pp("bn2"))?,
         })
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let out = self.c1.forward(x)?.relu()?;
-        let out = self.c2.forward(&out)?;
+    fn forward(&self, x: &Tensor, train: bool) -> Result<Tensor> {
+        let out = self.bn1.forward_t(&self.c1.forward(x)?, train)?.relu()?;
+        let out = self.bn2.forward_t(&self.c2.forward(&out)?, train)?;
         (out + x)?.relu()
     }
 }
@@ -48,12 +58,15 @@ impl ResBlock {
 
 pub struct HextoeNet {
     init_conv: Conv2d,
+    init_bn: BatchNorm,
     res: Vec<ResBlock>,
     // policy head
     p_conv: Conv2d,
+    p_bn: BatchNorm,
     p_fc: Linear,
     // value head
     v_conv: Conv2d,
+    v_bn: BatchNorm,
     v_fc1: Linear,
     v_fc2: Linear,
 }
@@ -64,38 +77,41 @@ impl HextoeNet {
         let no_pad = Conv2dConfig::default();
         Ok(HextoeNet {
             init_conv: conv2d(CHANNELS, HIDDEN, 3, pad1, vb.pp("init"))?,
+            init_bn: batch_norm(HIDDEN, 1e-5, vb.pp("init_bn"))?,
             res: (0..RES_BLOCKS)
                 .map(|i| ResBlock::new(vb.pp(&format!("r{i}"))))
                 .collect::<Result<_>>()?,
             p_conv: conv2d(HIDDEN, POLICY_CH, 1, no_pad, vb.pp("pc"))?,
+            p_bn: batch_norm(POLICY_CH, 1e-5, vb.pp("p_bn"))?,
             p_fc: linear(POLICY_CH * GRID * GRID, GRID * GRID, vb.pp("pf"))?,
             v_conv: conv2d(HIDDEN, VALUE_CH, 1, no_pad, vb.pp("vc"))?,
+            v_bn: batch_norm(VALUE_CH, 1e-5, vb.pp("v_bn"))?,
             v_fc1: linear(VALUE_CH * GRID * GRID, VALUE_FC, vb.pp("vf1"))?,
             v_fc2: linear(VALUE_FC, 1, vb.pp("vf2"))?,
         })
     }
 
-    /// Shared trunk used by both heads.
-    fn forward_trunk(&self, x: &Tensor) -> Result<Tensor> {
-        let mut h = self.init_conv.forward(x)?.relu()?;
+    /// Shared trunk. Pass `train=true` during gradient updates, `false` during inference.
+    fn forward_trunk(&self, x: &Tensor, train: bool) -> Result<Tensor> {
+        let mut h = self.init_bn.forward_t(&self.init_conv.forward(x)?, train)?.relu()?;
         for b in &self.res {
-            h = b.forward(&h)?;
+            h = b.forward(&h, train)?;
         }
         Ok(h)
     }
 
-    fn forward_policy_head_from_trunk(&self, h: &Tensor) -> Result<Tensor> {
+    fn forward_policy_head_from_trunk(&self, h: &Tensor, train: bool) -> Result<Tensor> {
         // Returns policy logits with shape [B, GRID * GRID].
-        let p = self.p_conv.forward(h)?.relu()?;
+        let p = self.p_bn.forward_t(&self.p_conv.forward(h)?, train)?.relu()?;
         let (pb, pc, ph, pw) = p.dims4()?;
         let p = p.reshape((pb, pc * ph * pw))?;
         let policy = self.p_fc.forward(&p)?;
         Ok(policy)
     }
 
-    fn forward_value_head_from_trunk(&self, h: &Tensor) -> Result<Tensor> {
+    fn forward_value_head_from_trunk(&self, h: &Tensor, train: bool) -> Result<Tensor> {
         // Returns value with shape [B, 1] in [-1, 1].
-        let v = self.v_conv.forward(h)?.relu()?;
+        let v = self.v_bn.forward_t(&self.v_conv.forward(h)?, train)?.relu()?;
         let (vb_, vc, vh, vw) = v.dims4()?;
         let v = v.reshape((vb_, vc * vh * vw))?;
         let v = self.v_fc1.forward(&v)?.relu()?;
@@ -103,15 +119,23 @@ impl HextoeNet {
         Ok(value)
     }
 
-    /// Forward pass.
+    /// Forward pass for training (batch norm in train mode).
     ///
     /// `x`: `[B, CHANNELS, GRID, GRID]`
     ///
     /// Returns `(policy_logits [B, GRID²], value [B, 1])`.
     pub fn forward(&self, x: &Tensor) -> Result<(Tensor, Tensor)> {
-        let h = self.forward_trunk(x)?;
-        let policy = self.forward_policy_head_from_trunk(&h)?;
-        let value = self.forward_value_head_from_trunk(&h)?;
+        let h = self.forward_trunk(x, true)?;
+        let policy = self.forward_policy_head_from_trunk(&h, true)?;
+        let value = self.forward_value_head_from_trunk(&h, true)?;
+        Ok((policy, value))
+    }
+
+    /// Forward pass for inference (batch norm in eval mode — uses running statistics).
+    pub fn forward_inference(&self, x: &Tensor) -> Result<(Tensor, Tensor)> {
+        let h = self.forward_trunk(x, false)?;
+        let policy = self.forward_policy_head_from_trunk(&h, false)?;
+        let value = self.forward_value_head_from_trunk(&h, false)?;
         Ok((policy, value))
     }
 
@@ -128,9 +152,9 @@ impl HextoeNet {
     ) -> Result<(Vec<f32>, f32)> {
         let enc = encode_state(state);
         let t = Tensor::from_slice(&enc, (1usize, CHANNELS, GRID, GRID), device)?;
-        let h = self.forward_trunk(&t)?;
-        let logits = self.forward_policy_head_from_trunk(&h)?;
-        let value_t = self.forward_value_head_from_trunk(&h)?;
+        let h = self.forward_trunk(&t, false)?;
+        let logits = self.forward_policy_head_from_trunk(&h, false)?;
+        let value_t = self.forward_value_head_from_trunk(&h, false)?;
 
         // Mask logits: set non-legal positions to -inf, then softmax.
         let center = board_center(state);
@@ -160,8 +184,8 @@ impl HextoeNet {
     pub fn evaluate_value_state(&self, state: &GameState, device: &Device) -> Result<f32> {
         let enc = encode_state(state);
         let t = Tensor::from_slice(&enc, (1usize, CHANNELS, GRID, GRID), device)?;
-        let h = self.forward_trunk(&t)?;
-        let value_t = self.forward_value_head_from_trunk(&h)?;
+        let h = self.forward_trunk(&t, false)?;
+        let value_t = self.forward_value_head_from_trunk(&h, false)?;
         let v: f32 = value_t.reshape((1usize,))?.to_vec1::<f32>()?[0];
         Ok(v)
     }
