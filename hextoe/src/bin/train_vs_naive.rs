@@ -36,7 +36,7 @@ fn main() {
     let lr           = parse_arg_f64(&args, "--lr",         3e-4);
     let eval_games   = parse_arg(&args, "--eval-games",     40usize);
     let eval_every   = parse_arg(&args, "--eval-every",     5usize);
-    let win_rate_thr = parse_arg_f64(&args, "--win-rate",   0.95);
+    let win_rate_thr = parse_arg_f64(&args, "--win-rate",   1.00);
     let win_streak   = parse_arg(&args, "--win-streak",     3usize);
     let buf_cap      = parse_arg(&args, "--buffer",         20_000usize);
     let out_path     = parse_arg_str(&args, "--out",        DEFAULT_NNUE_PATH);
