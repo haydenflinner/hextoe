@@ -5,7 +5,7 @@ use rand::{Rng, SeedableRng};
 
 use hextoe::encode::{action_to_index, board_center, encode_state, index_to_action, CHANNELS, GRID};
 use hextoe::game::{GameState, Player};
-use hextoe::mcts::naive_best_move;
+use hextoe::mcts::{compound_threat_priors, naive_best_move};
 use hextoe::supervised::{build_sample_index, encode_sample, load_raw_games_multi, RawGame};
 
 /// Data sampler backed by Rust game replay + encoding.
@@ -233,6 +233,29 @@ impl PyGameState {
 
     fn total_moves(&self) -> u32 {
         self.inner.total_moves
+    }
+
+    /// Returns normalized tactical prior weights for all legal actions.
+    ///
+    /// Uses compound-threat heuristics (blocking 4-in-a-row, 5-in-a-row, forks, etc.).
+    /// Returns an empty list when there are no meaningful threats (all weights equal),
+    /// so the caller can skip blending when the position is quiet.
+    ///
+    /// Each entry is ((q, r), weight) with weights summing to 1.0.
+    fn tactical_priors(&self) -> Vec<((i32, i32), f32)> {
+        let actions = self.inner.legal_actions();
+        if actions.is_empty() {
+            return vec![];
+        }
+        let me = self.inner.current_player();
+        let opp = me.other();
+        let raw = compound_threat_priors(&self.inner, &actions, me, opp);
+        let max_w = raw.iter().map(|(_, w)| *w).fold(0.0f32, f32::max);
+        if max_w <= 1.0 {
+            return vec![];  // quiet position — no tactical override needed
+        }
+        let total: f32 = raw.iter().map(|(_, w)| w).sum();
+        raw.into_iter().map(|(p, w)| (p, w / total)).collect()
     }
 }
 
