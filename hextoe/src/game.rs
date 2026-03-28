@@ -185,10 +185,12 @@ pub fn max_run_through(board: &HashMap<Pos, Player>, pos: Pos, player: Player) -
 /// Use this to detect multi-axis threats: if two or more elements are ≥ 3, placing at
 /// `pos` creates threats on multiple axes simultaneously (Triangle / Rhombus pattern).
 pub fn runs_per_axis(board: &HashMap<Pos, Player>, pos: Pos, player: Player) -> [u32; 3] {
+    // count_axis starts at 1 (counting pos itself) and adds neighbours, so it
+    // already returns the full run length through pos — no adjustment needed.
     [
-        count_axis(board, pos, player, WIN_AXES[0].0, WIN_AXES[0].1) + 1,
-        count_axis(board, pos, player, WIN_AXES[1].0, WIN_AXES[1].1) + 1,
-        count_axis(board, pos, player, WIN_AXES[2].0, WIN_AXES[2].1) + 1,
+        count_axis(board, pos, player, WIN_AXES[0].0, WIN_AXES[0].1),
+        count_axis(board, pos, player, WIN_AXES[1].0, WIN_AXES[1].1),
+        count_axis(board, pos, player, WIN_AXES[2].0, WIN_AXES[2].1),
     ]
 }
 
