@@ -221,11 +221,15 @@ fn main() {
                     z.push(sp_usable[i].outcome);
                 }
 
-                // Human portion
+                // Human portion — also collect (batch_row, move_idx) for policy supervision.
                 let hu_take = hu_per_batch.min(human_records.len());
-                for &i in &hu_idx[..hu_take] {
+                let mut hu_pol_pairs: Vec<(u32, usize)> = Vec::new(); // (batch_row, move_idx)
+                for (j, &i) in hu_idx[..hu_take].iter().enumerate() {
                     feats.push(human_records[i].feats.iter().map(|&f| f as usize).collect());
                     z.push(human_records[i].outcome);
+                    if let Some(midx) = human_records[i].move_idx {
+                        hu_pol_pairs.push(((sp_take + j) as u32, midx as usize));
+                    }
                 }
 
                 if feats.is_empty() { continue; }
@@ -237,21 +241,34 @@ fn main() {
                     let (value_output, policy_logits) = model.forward_value_and_policy(&input)?;
                     let value_loss = (&value_output - &target)?.sqr()?.mean_all()?;
 
-                    // Policy loss: cross-entropy on self-play portion only.
-                    let policy_loss_val = if sp_take > 0 {
-                        let mut pi_data = vec![0.0f32; sp_take * GRID * GRID];
-                        for (i, &si) in sp_idx[..sp_take].iter().enumerate() {
-                            pi_data[i * GRID * GRID..(i + 1) * GRID * GRID]
-                                .copy_from_slice(&*sp_usable[si].pi);
-                        }
-                        let pi_targets = Tensor::from_vec(pi_data, (sp_take, GRID * GRID), &device)?;
-                        let sp_logits = policy_logits.narrow(0, 0, sp_take)?;
-                        let log_probs = log_softmax(&sp_logits, 1)?;
-                        // Cross-entropy: -mean(sum(pi * log_p, dim=1))
-                        let ce = (pi_targets * log_probs)?.sum(1)?.mean_all()?;
-                        (ce * (-1.0f64))?
-                    } else {
+                    // Policy loss: self-play soft targets + human one-hot targets.
+                    let mut pol_row_ids: Vec<u32> = Vec::new();
+                    let mut pol_targets_flat: Vec<f32> = Vec::new();
+
+                    // SP rows: MCTS pi distributions
+                    for (i, &si) in sp_idx[..sp_take].iter().enumerate() {
+                        pol_row_ids.push(i as u32);
+                        pol_targets_flat.extend_from_slice(&*sp_usable[si].pi);
+                    }
+
+                    // Human rows: one-hot from move_idx
+                    for &(row, midx) in &hu_pol_pairs {
+                        pol_row_ids.push(row);
+                        let mut one_hot = vec![0.0f32; GRID * GRID];
+                        one_hot[midx] = 1.0;
+                        pol_targets_flat.extend_from_slice(&one_hot);
+                    }
+
+                    let policy_loss_val = if pol_row_ids.is_empty() {
                         Tensor::zeros((), candle_core::DType::F32, &device)?
+                    } else {
+                        let n = pol_row_ids.len();
+                        let idx_t = Tensor::from_vec(pol_row_ids, (n,), &device)?;
+                        let sel_logits = policy_logits.index_select(&idx_t, 0)?;
+                        let log_probs = log_softmax(&sel_logits, 1)?;
+                        let pi_t = Tensor::from_vec(pol_targets_flat, (n, GRID * GRID), &device)?;
+                        let ce = (pi_t * log_probs)?.sum(1)?.mean_all()?;
+                        (ce * (-1.0f64))?
                     };
 
                     let scaled_policy_loss = (&policy_loss_val * policy_weight)?;
