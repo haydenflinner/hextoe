@@ -69,7 +69,7 @@ pub trait RolloutPolicy {
 ///     5 — create 3-in-a-row on any axis
 ///     4 — block opp 3-in-a-row
 ///     1 — normal move
-pub(crate) fn move_weight(
+pub fn move_weight(
     board: &std::collections::HashMap<crate::game::Pos, crate::game::Player>,
     pos: crate::game::Pos,
     me: crate::game::Player,
@@ -105,6 +105,25 @@ pub(crate) fn move_weight(
     } else {
         1.0
     }
+}
+
+/// Pick the best tactical move for the naive player using `move_weight` heuristics.
+/// Returns `None` only when there are no legal actions.
+pub fn naive_best_move(state: &GameState) -> Option<Pos> {
+    let actions = state.legal_actions();
+    if actions.is_empty() {
+        return None;
+    }
+    let me = state.current_player();
+    let opp = me.other();
+    actions
+        .iter()
+        .copied()
+        .max_by(|&a, &b| {
+            move_weight(&state.board, a, me, opp)
+                .partial_cmp(&move_weight(&state.board, b, me, opp))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
 }
 
 /// Compute PUCT prior weights for `actions` with compound-threat awareness.

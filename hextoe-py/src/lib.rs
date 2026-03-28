@@ -1,9 +1,11 @@
-use ndarray::{Array1, Array2, Array4};
-use numpy::{PyArray1, PyArray2, PyArray4, ToPyArray};
+use ndarray::{Array1, Array2, Array3, Array4};
+use numpy::{PyArray1, PyArray2, PyArray3, PyArray4, ToPyArray};
 use pyo3::prelude::*;
 use rand::{Rng, SeedableRng};
 
-use hextoe::encode::{CHANNELS, GRID};
+use hextoe::encode::{action_to_index, board_center, encode_state, index_to_action, CHANNELS, GRID};
+use hextoe::game::{GameState, Player};
+use hextoe::mcts::naive_best_move;
 use hextoe::supervised::{build_sample_index, encode_sample, load_raw_games_multi, RawGame};
 
 /// Data sampler backed by Rust game replay + encoding.
@@ -149,9 +151,95 @@ impl Sampler {
     }
 }
 
+/// Python-accessible wrapper around `GameState`.
+#[pyclass]
+struct PyGameState {
+    inner: GameState,
+}
+
+#[pymethods]
+impl PyGameState {
+    #[new]
+    fn new() -> Self {
+        PyGameState { inner: GameState::new() }
+    }
+
+    fn clone(&self) -> Self {
+        PyGameState { inner: self.inner.clone() }
+    }
+
+    /// Place a stone at axial (q, r). Returns True if legal.
+    fn place(&mut self, q: i32, r: i32) -> bool {
+        self.inner.place((q, r))
+    }
+
+    fn is_terminal(&self) -> bool {
+        self.inner.is_terminal()
+    }
+
+    /// Returns list of (q, r) tuples for all legal moves.
+    fn legal_actions(&self) -> Vec<(i32, i32)> {
+        self.inner.legal_actions()
+    }
+
+    /// 0 = Player X, 1 = Player O.
+    fn current_player(&self) -> u8 {
+        match self.inner.current_player() {
+            Player::X => 0,
+            Player::O => 1,
+        }
+    }
+
+    /// Returns 0 (X won), 1 (O won), or -1 (no winner yet).
+    fn winner(&self) -> i8 {
+        match self.inner.winner {
+            Some(Player::X) => 0,
+            Some(Player::O) => 1,
+            None => -1,
+        }
+    }
+
+    /// Encode current state as numpy [CHANNELS, GRID, GRID] float32.
+    fn encode<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray3<f32>> {
+        let flat = encode_state(&self.inner);
+        let arr = Array3::from_shape_vec((CHANNELS, GRID, GRID), flat.to_vec()).unwrap();
+        arr.to_pyarray_bound(py)
+    }
+
+    /// Board centroid (q, r) — used as origin for action index mapping.
+    fn board_center(&self) -> (i32, i32) {
+        board_center(&self.inner)
+    }
+
+    /// Convert axial position to flat grid index (row*GRID+col). Returns -1 if out of bounds.
+    fn action_to_index(&self, q: i32, r: i32) -> i64 {
+        let center = board_center(&self.inner);
+        match action_to_index((q, r), center) {
+            Some(idx) => idx as i64,
+            None => -1,
+        }
+    }
+
+    /// Convert flat grid index back to (q, r).
+    fn index_to_action(&self, idx: usize) -> (i32, i32) {
+        let center = board_center(&self.inner);
+        index_to_action(idx, center)
+    }
+
+    /// Pick the best tactical (naive) move. Returns (q, r) or None if terminal.
+    fn naive_move(&self) -> Option<(i32, i32)> {
+        naive_best_move(&self.inner)
+    }
+
+    fn total_moves(&self) -> u32 {
+        self.inner.total_moves
+    }
+}
+
 #[pymodule]
 fn hextoe_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Sampler>()?;
+    m.add_class::<PyGameState>()?;
     m.add("GRID", GRID)?;
     m.add("CHANNELS", CHANNELS)?;
     Ok(())
