@@ -145,8 +145,12 @@ class MCTSNode:
     def q(self):
         return self.value_sum / self.visit if self.visit > 0 else 0.0
 
-    def ucb(self, parent_visit, c_puct):
-        return -self.q() + c_puct * self.prior * (parent_visit ** 0.5) / (1 + self.visit)
+    def ucb(self, parent_visit, c_puct, same_player=False):
+        # If same player moves again (pair-move rule), child's q is already from our
+        # perspective — use it directly.  If the player changed, negate to convert from
+        # the opponent's perspective to ours.
+        q = self.q() if same_player else -self.q()
+        return q + c_puct * self.prior * (parent_visit ** 0.5) / (1 + self.visit)
 
 
 def mcts_search(model, root_state, n_sims, device, c_puct=2.0, temperature=1.0):
@@ -163,10 +167,13 @@ def mcts_search(model, root_state, n_sims, device, c_puct=2.0, temperature=1.0):
         path = [node]
         # Selection
         while node.expanded and not node.state.is_terminal():
-            pv = node.state.total_moves()
+            parent_player = node.state.current_player()
             best_child = max(
                 node.children.values(),
-                key=lambda ch: ch.ucb(node.visit + 1, c_puct),
+                key=lambda ch: ch.ucb(
+                    node.visit + 1, c_puct,
+                    same_player=(ch.state.current_player() == parent_player),
+                ),
             )
             node = best_child
             path.append(node)
@@ -184,12 +191,15 @@ def mcts_search(model, root_state, n_sims, device, c_puct=2.0, temperature=1.0):
             _, leaf_value = net_eval(model, node.state, device)
             # leaf_value is from current player's perspective
 
-        # Backup — flip sign each level going up.
+        # Backup — only flip sign when the active player changes (pair-move rule means
+        # consecutive nodes can share the same player, in which case no flip).
         value = leaf_value
-        for n in reversed(path):
+        for i in range(len(path) - 1, -1, -1):
+            n = path[i]
             n.visit += 1
             n.value_sum += value
-            value = -value
+            if i > 0 and path[i].state.current_player() != path[i - 1].state.current_player():
+                value = -value
 
     # Build policy from visit counts.
     center = root_state.board_center()
