@@ -901,28 +901,7 @@ pub fn run_training(
         );
 
         let sp_phase = Instant::now();
-        let (new_records, game_secs, games_played) = if config.use_nnue_rollout {
-            // Extract current NNUE weights into a thread-safe Arc for parallel games.
-            let weights = NNUEWeights::from_varmap(&nnue_varmap)
-                .map(std::sync::Arc::new)
-                .unwrap_or_else(|e| {
-                    log_line(&monitor, log_stdout, &format!("  NNUE weight extraction failed: {e}; falling back to random rollout"));
-                    // Fallback: build default weights (random; better than crashing)
-                    let (vm, _) = build_nnue_model(&Device::Cpu).expect("nnue fallback");
-                    std::sync::Arc::new(NNUEWeights::from_varmap(&vm).expect("nnue fallback weights"))
-                });
-            let rollout = NNUERollout::new(weights);
-            self_play_until_duration(
-                &collector,
-                &config,
-                &mut rng,
-                &rollout,
-                &monitor,
-                log_stdout,
-                &cancel,
-                &mut buffer,
-            )
-        } else if config.use_random_rollout {
+        let (new_records, game_secs, games_played) = if config.use_random_rollout {
             let rollout = RandomRollout;
             self_play_until_duration(
                 &collector,
@@ -1008,27 +987,16 @@ pub fn run_training(
         }
 
         let mut total_loss = 0.0f32;
-        let mut nnue_total_loss = 0.0f32;
-        let mut nnue_steps = 0usize;
         for _ in 0..config.train_steps {
             let batch = buffer.sample_batch(config.batch_size, &mut rng);
             let loss = train_step(&model, &batch, &device, &mut opt)?;
             total_loss += loss;
-            if let Ok(Some(nl)) = nnue_train_step(&nnue_model, &batch, &Device::Cpu, &mut nnue_opt) {
-                nnue_total_loss += nl;
-                nnue_steps += 1;
-            }
         }
         let mean_loss = total_loss / config.train_steps as f32;
-        let nnue_loss_str = if nnue_steps > 0 {
-            format!("  nnue loss = {:.4}", nnue_total_loss / nnue_steps as f32)
-        } else {
-            "  nnue loss = n/a (no NNUE-encoded records yet)".to_string()
-        };
         log_line(
             &monitor,
             log_stdout,
-            &format!("  cnn loss = {mean_loss:.4}  |  {nnue_loss_str}"),
+            &format!("  cnn loss = {mean_loss:.4}"),
         );
 
         if let Some(m) = &monitor {
@@ -1040,11 +1008,7 @@ pub fn run_training(
 
         let mut vm = varmap.clone();
         save_weights(&mut vm, &config.latest_path)?;
-        // Save NNUE checkpoint alongside CNN.
-        if let Err(e) = nnue_varmap.save(&config.nnue_path) {
-            log_line(&monitor, log_stdout, &format!("  NNUE save failed: {e}"));
-        }
-        let ck_msg = format!("checkpoint → {}  nnue → {}", config.latest_path, config.nnue_path);
+        let ck_msg = format!("checkpoint → {}", config.latest_path);
         log_line(&monitor, log_stdout, &format!("  {ck_msg}"));
         if let Some(m) = &monitor {
             if let Ok(mut g) = m.lock() {
@@ -1156,38 +1120,6 @@ pub fn run_training(
     }
 
     Ok(())
-}
-
-/// Training step for the NNUE value network (MSE loss on value head only).
-/// Records without NNUE features (`nnue_feats` empty) are silently skipped.
-pub fn nnue_train_step(
-    net: &NNUENet,
-    batch: &[&GameRecord],
-    _device: &Device,
-    opt: &mut AdamW,
-) -> candle_core::Result<Option<f32>> {
-    // Filter to records that have NNUE features.
-    let usable: Vec<&&GameRecord> = batch.iter().filter(|r| !r.nnue_feats.is_empty()).collect();
-    if usable.is_empty() {
-        return Ok(None);
-    }
-    let features_batch: Vec<Vec<usize>> = usable
-        .iter()
-        .map(|r| r.nnue_feats.iter().map(|&f| f as usize).collect())
-        .collect();
-    let z_data: Vec<f32> = usable.iter().map(|r| r.outcome).collect();
-    let b = usable.len();
-
-    // Always train NNUE on CPU regardless of the CNN device.
-    let cpu = Device::Cpu;
-    let target = Tensor::from_slice(&z_data, (b, 1usize), &cpu)?;
-
-    let input = NNUENet::dense_from_sparse(&features_batch, &cpu)?;
-    let output = net.forward(&input)?;
-    let loss = (&output - &target)?.sqr()?.mean_all()?;
-    opt.backward_step(&loss)?;
-
-    Ok(Some(loss.to_scalar::<f32>()?))
 }
 
 pub fn train_step(

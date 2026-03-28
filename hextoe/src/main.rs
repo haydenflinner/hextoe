@@ -102,9 +102,7 @@ impl App {
             last_pos: None,
             pan_offset: egui::Vec2::ZERO,
             hex_size: HEX_SIZE_DEFAULT,
-            rollout_mode: if nnue_checkpoint_hint {
-                RolloutMode::Nnue
-            } else if nn_checkpoint_hint {
+            rollout_mode: if nn_checkpoint_hint {
                 RolloutMode::Neural
             } else {
                 RolloutMode::Random
