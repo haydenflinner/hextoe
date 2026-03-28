@@ -1,18 +1,13 @@
 /// AlphaZero-style combined policy+value network for Hextoe.
 ///
 /// Architecture:
-///   trunk  : Conv(4→128, 3×3) + BN + ReLU, then 8 residual blocks (128 ch)
-///            Each residual block: Conv(128→128, 3×3) + BN + ReLU + Conv + BN + skip + ReLU
-///   policy : Conv(128→2, 1×1) + BN + ReLU → flatten → Linear(2·G²→G²)  (logits)
-///   value  : Conv(128→1, 1×1) + BN + ReLU → flatten → Linear(G²→256) + ReLU
+///   trunk  : Conv(4→64, 3×3) + BN + ReLU, then 4 residual blocks (64 ch)
+///            Each residual block: Conv(64→64, 3×3) + BN + ReLU + Conv + BN + skip + ReLU
+///   policy : Conv(64→2, 1×1) + BN + ReLU → flatten → Linear(2·G²→G²)  (logits)
+///   value  : Conv(64→1, 1×1) + BN + ReLU → flatten → Linear(G²→256) + ReLU
 ///            → Linear(256→1) + Tanh
 ///
 /// where G = encode::GRID = 33.
-///
-/// The larger grid (33×33 vs the old 21×21) covers a radius-16 window around the board
-/// centroid — sufficient for >99% of real competitive games. The deeper/wider trunk gives
-/// the network enough receptive field and capacity to reason about formations like the
-/// Island Gambit that span the full board extent.
 use candle_core::{DType, Device, ModuleT, Result, Tensor};
 use candle_nn::{batch_norm, conv2d, linear, BatchNorm, Conv2d, Conv2dConfig, Linear, Module, VarBuilder, VarMap};
 use rand::Rng;
@@ -21,8 +16,8 @@ use crate::encode::{action_to_index, board_center, encode_state, index_to_action
 use crate::game::{GameState, Player, Pos};
 use crate::mcts::{RandomRollout, RolloutPolicy, MAX_GAME_MOVES};
 
-const HIDDEN: usize = 128;
-const RES_BLOCKS: usize = 8;
+const HIDDEN: usize = 64;
+const RES_BLOCKS: usize = 4;
 const POLICY_CH: usize = 2;
 const VALUE_CH: usize = 1;
 const VALUE_FC: usize = 256;
