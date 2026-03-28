@@ -361,7 +361,7 @@ def play_game_self(model, n_sims, device, temp_moves=10, max_moves=120, eval_bat
             game_outcome = -1.0
         # Blend MCTS root-Q with sparse game outcome.
         # MCTS Q is a richer, per-position signal; game outcome anchors it to reality.
-        value_target = 0.75 * mcts_q + 0.25 * game_outcome
+        value_target = 0.25 * mcts_q + 0.75 * game_outcome
         samples.append((enc, pi, value_target))
     return samples
 
@@ -399,7 +399,7 @@ def play_game_vs_naive(model, n_sims, device, model_plays_x=True, max_moves=120,
             game_outcome = 1.0
         else:
             game_outcome = -1.0
-        value_target = 0.75 * mcts_q + 0.25 * game_outcome
+        value_target = 0.25 * mcts_q + 0.75 * game_outcome
         samples.append((enc, pi, value_target))
     return samples
 

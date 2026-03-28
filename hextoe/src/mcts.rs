@@ -533,7 +533,10 @@ impl Mcts {
                 Some((pos, win_rate, n.visits, policy_share))
             })
             .collect();
-        results.sort_by(|a, b| b.1.total_cmp(&a.1));
+        // Sort by visit count (AlphaZero convention: most-visited = best recommendation).
+        // Q-score (index 1) is unreliable when the value function is miscalibrated;
+        // visit count is the robust signal — MCTS spends more effort where it's truly better.
+        results.sort_by(|a, b| b.2.cmp(&a.2));
         results.truncate(top_n);
         results
     }
