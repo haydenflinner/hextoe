@@ -1213,9 +1213,8 @@ pub fn nnue_train_step(
     let cpu = Device::Cpu;
     let target = Tensor::from_slice(&z_data, (b, 1usize), &cpu)?;
 
-    // Sparse forward: only touches active feature columns of fc0.weight (~50× faster
-    // than dense_from_sparse + forward when N_FEATURES is large).
-    let output = net.forward_sparse(&features_batch, &cpu)?;
+    let input = NNUENet::dense_from_sparse(&features_batch, &cpu)?;
+    let output = net.forward(&input)?;
     let loss = (&output - &target)?.sqr()?.mean_all()?;
     opt.backward_step(&loss)?;
 

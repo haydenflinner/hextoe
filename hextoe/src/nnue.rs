@@ -125,46 +125,7 @@ impl NNUENet {
         self.fc3.forward(&x)?.tanh()
     }
 
-    /// Sparse forward pass for training — avoids the O(batch × N_FEATURES) dense matmul.
-    ///
-    /// Pads all feature lists in the batch to the same length, does ONE batched
-    /// index_select into fc0.weight, then masks out padding and sums per sample.
-    /// Intermediate tensor is [batch × max_active × L1_SIZE] rather than
-    /// [batch × N_FEATURES × L1_SIZE], giving a ~50× speedup when N_FEATURES is large.
-    pub fn forward_sparse(&self, features_batch: &[Vec<usize>], device: &Device) -> CResult<Tensor> {
-        let b = features_batch.len();
-        let max_len = features_batch.iter().map(|f| f.len()).max().unwrap_or(0).max(1);
-
-        // Build padded index [b × max_len] and float mask [b, max_len, 1].
-        // Padding entries use index 0 and are zeroed out by the mask.
-        let mut idx_data  = vec![0u32;  b * max_len];
-        let mut mask_data = vec![0.0f32; b * max_len];
-        for (i, feats) in features_batch.iter().enumerate() {
-            for (j, &f) in feats.iter().enumerate() {
-                idx_data [i * max_len + j] = f as u32;
-                mask_data[i * max_len + j] = 1.0;
-            }
-        }
-
-        let idx  = Tensor::from_vec(idx_data,  (b * max_len,), device)?;
-        let mask = Tensor::from_vec(mask_data, (b, max_len, 1), device)?;
-
-        // w0_t: [N_FEATURES, L1_SIZE] — must be contiguous for index_select.
-        let w0_t = self.fc0.weight().t()?.contiguous()?;
-        let b0   = self.fc0.bias().expect("fc0 bias");
-
-        // ONE index_select: [b*max_len, L1_SIZE] → [b, max_len, L1_SIZE]
-        let rows = w0_t.index_select(&idx, 0)?.reshape((b, max_len, L1_SIZE))?;
-        // Masked sum: broadcast mask [b, max_len, 1] → [b, max_len, L1_SIZE], then sum.
-        let acc  = rows.broadcast_mul(&mask)?.sum(1)?.broadcast_add(&b0.unsqueeze(0)?)?.clamp(0f32, 1f32)?;
-
-        let l2 = self.fc1.forward(&acc)?.clamp(0f32, 1f32)?;
-        let l3 = self.fc2.forward(&l2)?.clamp(0f32, 1f32)?;
-        self.fc3.forward(&l3)?.tanh()
-    }
-
     /// Build a dense `[batch, N_FEATURES]` tensor from a batch of sparse feature lists.
-    /// Kept for compatibility; prefer `forward_sparse` for training.
     pub fn dense_from_sparse(features_batch: &[Vec<usize>], device: &Device) -> CResult<Tensor> {
         let batch = features_batch.len();
         let mut data = vec![0.0f32; batch * N_FEATURES];
