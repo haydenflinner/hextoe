@@ -131,6 +131,17 @@ def net_eval(model, state, device):
     return probs, float(v[0, 0].cpu())
 
 
+def net_eval_batch(model, nodes, device):
+    """Evaluate a list of MCTSNodes in one forward pass. Returns (probs_list, values_list)."""
+    encs = np.stack([n.state.encode() for n in nodes])
+    x = torch.from_numpy(encs).to(device)
+    with torch.no_grad():
+        logits, v = model(x)
+    probs_list = F.softmax(logits, dim=1).cpu().numpy()
+    values_list = v[:, 0].cpu().numpy()
+    return probs_list, values_list
+
+
 class MCTSNode:
     __slots__ = ("state", "prior", "visit", "value_sum", "children", "expanded")
 
@@ -153,56 +164,90 @@ class MCTSNode:
         return q + c_puct * self.prior * (parent_visit ** 0.5) / (1 + self.visit)
 
 
-def mcts_search(model, root_state, n_sims, device, c_puct=2.0, temperature=1.0):
-    """
-    Run MCTS from root_state. Returns a policy vector of length G*G.
-    Value backup is from the CURRENT PLAYER's perspective at each node.
-    """
-    root = MCTSNode(root_state.clone())
-    # Prime root with network priors.
-    _expand(root, model, device)
+VIRTUAL_LOSS = 2.0  # temporarily penalise in-flight nodes to spread parallel selection
 
-    for _ in range(n_sims):
-        node = root
-        path = [node]
-        # Selection
-        while node.expanded and not node.state.is_terminal():
-            parent_player = node.state.current_player()
-            best_child = max(
-                node.children.values(),
-                key=lambda ch: ch.ucb(
-                    node.visit + 1, c_puct,
-                    same_player=(ch.state.current_player() == parent_player),
-                ),
-            )
-            node = best_child
-            path.append(node)
 
-        # Expansion / evaluation
-        if node.state.is_terminal():
-            winner = node.state.winner()
-            # value from perspective of whoever is to move at this node
-            # if node is terminal the current player lost (winner just played)
-            leaf_value = -1.0 if winner != node.state.current_player() else 1.0
-            # Actually: terminal means winner already set, so current player didn't win.
-            leaf_value = -1.0
+def _select_leaf(root, c_puct):
+    """Walk tree to a leaf, applying virtual loss along the way. Returns (node, path)."""
+    node = root
+    path = [node]
+    while node.expanded and not node.state.is_terminal():
+        parent_player = node.state.current_player()
+        best_child = max(
+            node.children.values(),
+            key=lambda ch: ch.ucb(
+                node.visit + 1, c_puct,
+                same_player=(ch.state.current_player() == parent_player),
+            ),
+        )
+        # Apply virtual loss so parallel selections spread across different branches.
+        best_child.visit += 1
+        best_child.value_sum -= VIRTUAL_LOSS
+        node = best_child
+        path.append(node)
+    return node, path
+
+
+def _backup(path, leaf_value):
+    """Undo virtual loss and backup real value."""
+    value = leaf_value
+    for i in range(len(path) - 1, -1, -1):
+        n = path[i]
+        # Undo the virtual-loss visit that was pre-applied during selection
+        # (only for non-root nodes that had it applied).
+        if i > 0:
+            n.value_sum += VIRTUAL_LOSS  # cancel virtual loss
+            # visit count was already incremented; just update value_sum net
         else:
-            _expand(node, model, device)
-            _, leaf_value = net_eval(model, node.state, device)
-            # leaf_value is from current player's perspective
-
-        # Backup — only flip sign when the active player changes (pair-move rule means
-        # consecutive nodes can share the same player, in which case no flip).
-        value = leaf_value
-        for i in range(len(path) - 1, -1, -1):
-            n = path[i]
             n.visit += 1
             n.value_sum += value
-            if i > 0 and path[i].state.current_player() != path[i - 1].state.current_player():
-                value = -value
+            break
+        n.value_sum += value
+        if path[i].state.current_player() != path[i - 1].state.current_player():
+            value = -value
+
+
+def mcts_search(model, root_state, n_sims, device, c_puct=2.0, temperature=1.0, eval_batch=8):
+    """
+    Run MCTS from root_state with batched leaf evaluation.
+    eval_batch leaves are selected per round and evaluated in one forward pass,
+    giving much better GPU utilisation than batch=1.
+    """
+    root = MCTSNode(root_state.clone())
+    _expand(root, model, device)  # prime root priors (single eval)
+
+    sims_done = 0
+    while sims_done < n_sims:
+        batch = min(eval_batch, n_sims - sims_done)
+
+        # Select `batch` leaves (with virtual loss so they diverge).
+        leaves, paths = [], []
+        terminal_backups = []
+        for _ in range(batch):
+            leaf, path = _select_leaf(root, c_puct)
+            if leaf.state.is_terminal():
+                terminal_backups.append(path)
+                leaves.append(None)
+            else:
+                leaves.append(leaf)
+            paths.append(path)
+
+        # Batch-evaluate all non-terminal leaves in one network call.
+        non_term = [(i, leaf) for i, leaf in enumerate(leaves) if leaf is not None]
+        if non_term:
+            idxs, nodes = zip(*non_term)
+            probs_batch, values_batch = net_eval_batch(model, list(nodes), device)
+            for j, (orig_i, leaf) in enumerate(non_term):
+                if not leaf.expanded:
+                    _expand_with_probs(leaf, probs_batch[j])
+                _backup(paths[orig_i], float(values_batch[j]))
+
+        for path in terminal_backups:
+            _backup(path, -1.0)
+
+        sims_done += batch
 
     # Build policy from visit counts.
-    center = root_state.board_center()
     pi = np.zeros(G2, dtype=np.float32)
     for action, child in root.children.items():
         idx = root_state.action_to_index(action[0], action[1])
@@ -211,23 +256,20 @@ def mcts_search(model, root_state, n_sims, device, c_puct=2.0, temperature=1.0):
 
     if pi.sum() == 0:
         pi[:] = 1.0 / G2
+    elif temperature < 0.1:
+        best = np.argmax(pi)
+        pi[:] = 0.0
+        pi[best] = 1.0
     else:
-        if temperature < 0.1:
-            best = np.argmax(pi)
-            pi[:] = 0.0
-            pi[best] = 1.0
-        else:
-            pi = pi ** (1.0 / temperature)
-            s = pi.sum()
-            if s == 0:
-                pi[:] = 1.0 / G2
-            else:
-                pi /= s
+        pi = pi ** (1.0 / temperature)
+        s = pi.sum()
+        pi[:] = 1.0 / G2 if s == 0 else pi / s
 
     return pi
 
 
 def _expand(node, model, device):
+    """Expand node by evaluating with network (used for root priming)."""
     if node.expanded:
         return
     node.expanded = True
@@ -235,7 +277,17 @@ def _expand(node, model, device):
     if not actions:
         return
     probs, _ = net_eval(model, node.state, device)
-    center = node.state.board_center()
+    _expand_with_probs(node, probs)
+
+
+def _expand_with_probs(node, probs):
+    """Expand node using pre-computed policy probabilities (batch path)."""
+    if node.expanded:
+        return
+    node.expanded = True
+    actions = node.state.legal_actions()
+    if not actions:
+        return
     for action in actions:
         idx = node.state.action_to_index(action[0], action[1])
         prior = float(probs[idx]) if 0 <= idx < G2 else 1.0 / len(actions)
@@ -265,15 +317,15 @@ def pick_action_from_pi(state, pi):
 
 # ── Game generation ───────────────────────────────────────────────────────────
 
-def play_game_self(model, n_sims, device, temp_moves=10):
+def play_game_self(model, n_sims, device, temp_moves=10, max_moves=120, eval_batch=8):
     """Self-play game. Returns list of (state_enc, pi, outcome_placeholder)."""
     state = hextoe_py.PyGameState()
     records = []  # (enc [C,H,W], pi [G²], player_at_move)
 
     move_num = 0
-    while not state.is_terminal():
+    while not state.is_terminal() and move_num < max_moves:
         temp = 1.0 if move_num < temp_moves else 0.05
-        pi = mcts_search(model, state, n_sims, device, temperature=temp)
+        pi = mcts_search(model, state, n_sims, device, temperature=temp, eval_batch=eval_batch)
         enc = state.encode()
         player = state.current_player()
         records.append((enc, pi, player))
@@ -283,7 +335,6 @@ def play_game_self(model, n_sims, device, temp_moves=10):
         move_num += 1
 
     winner = state.winner()
-    # Assign outcome: +1 if you won, -1 if you lost, from each player's perspective.
     samples = []
     for enc, pi, player in records:
         if winner == -1:
@@ -296,7 +347,7 @@ def play_game_self(model, n_sims, device, temp_moves=10):
     return samples
 
 
-def play_game_vs_naive(model, n_sims, device, model_plays_x=True):
+def play_game_vs_naive(model, n_sims, device, model_plays_x=True, max_moves=120, eval_batch=8):
     """
     One game: model (X or O) vs naive opponent.
     Returns list of (enc, pi, outcome) for model's moves only.
@@ -304,11 +355,12 @@ def play_game_vs_naive(model, n_sims, device, model_plays_x=True):
     state = hextoe_py.PyGameState()
     model_player = 0 if model_plays_x else 1
     records = []
+    move_num = 0
 
-    while not state.is_terminal():
+    while not state.is_terminal() and move_num < max_moves:
         current = state.current_player()
         if current == model_player:
-            pi = mcts_search(model, state, n_sims, device, temperature=1.0)
+            pi = mcts_search(model, state, n_sims, device, temperature=1.0, eval_batch=eval_batch)
             enc = state.encode()
             records.append((enc, pi, model_player))
             action = pick_action_from_pi(state, pi)
@@ -317,6 +369,7 @@ def play_game_vs_naive(model, n_sims, device, model_plays_x=True):
             if action is None:
                 break
         state.place(action[0], action[1])
+        move_num += 1
 
     winner = state.winner()
     samples = []
@@ -354,7 +407,7 @@ def train_step(model, batch, opt, device):
 
 # ── Evaluation ────────────────────────────────────────────────────────────────
 
-def evaluate(candidate, champion, n_games, n_sims, device, it=0):
+def evaluate(candidate, champion, n_games, n_sims, device, it=0, max_moves=120, eval_batch=8):
     """
     Play `n_games` between candidate (X half the time) and champion.
     Returns candidate win-rate in [0, 1].
@@ -366,13 +419,15 @@ def evaluate(candidate, champion, n_games, n_sims, device, it=0):
         t_g = time.time()
         cand_is_x = (g % 2 == 0)
         state = hextoe_py.PyGameState()
-        while not state.is_terminal():
+        move_num = 0
+        while not state.is_terminal() and move_num < max_moves:
             current = state.current_player()
             is_cand = (cand_is_x and current == 0) or (not cand_is_x and current == 1)
             model = candidate if is_cand else champion
-            pi = mcts_search(model, state, n_sims, device, temperature=0.0)
+            pi = mcts_search(model, state, n_sims, device, temperature=0.0, eval_batch=eval_batch)
             action = pick_action_from_pi(state, pi)
             state.place(action[0], action[1])
+            move_num += 1
         winner = state.winner()
         cand_player = 0 if cand_is_x else 1
         if winner == cand_player:
@@ -402,6 +457,12 @@ def main():
     ap.add_argument("--naive-frac",         type=float, default=0.3,
                     help="Fraction of games played vs naive (rest are self-play)")
     ap.add_argument("--lr",                 type=float, default=3e-4)
+    ap.add_argument("--mcts-batch",         type=int,   default=8,
+                    help="Leaves evaluated per network call inside MCTS (higher = faster GPU)")
+    ap.add_argument("--max-moves",          type=int,   default=120,
+                    help="Terminate games after this many moves (prevents runaway games)")
+    ap.add_argument("--eval-every",         type=int,   default=1,
+                    help="Run champion evaluation every N iterations")
     ap.add_argument("--batch",              type=int,   default=256)
     ap.add_argument("--train-steps",        type=int,   default=200)
     ap.add_argument("--buffer",             type=int,   default=30000,
@@ -461,7 +522,9 @@ def main():
         for g in range(n_naive):
             t_g = time.time()
             samples = play_game_vs_naive(candidate, args.sims, device,
-                                         model_plays_x=(g % 2 == 0))
+                                         model_plays_x=(g % 2 == 0),
+                                         max_moves=args.max_moves,
+                                         eval_batch=args.mcts_batch)
             replay.extend(samples)
             new_samples += len(samples)
             print(f"  iter {it} game {g+1}/{total_games} (vs-naive) "
@@ -469,7 +532,9 @@ def main():
 
         for gi in range(n_self):
             t_g = time.time()
-            samples = play_game_self(candidate, args.sims, device)
+            samples = play_game_self(candidate, args.sims, device,
+                                     max_moves=args.max_moves,
+                                     eval_batch=args.mcts_batch)
             replay.extend(samples)
             new_samples += len(samples)
             print(f"  iter {it} game {n_naive+gi+1}/{total_games} (self-play) "
@@ -495,15 +560,21 @@ def main():
         # 3. Save latest.
         save_weights(candidate, args.latest)
 
-        # 4. Evaluate and possibly promote champion.
+        # 4. Evaluate and possibly promote champion (every eval_every iters).
         candidate.eval()
-        win_rate = evaluate(candidate, champion, args.eval_games, args.sims, device, it=it)
+        if it % args.eval_every == 0:
+            win_rate = evaluate(candidate, champion, args.eval_games, args.sims, device,
+                                it=it, max_moves=args.max_moves, eval_batch=args.mcts_batch)
+        else:
+            win_rate = -1.0  # skipped
         promoted = ""
-        if win_rate >= args.promote_threshold:
+        if win_rate < 0:
+            promoted = "  (eval skipped)"
+        elif win_rate >= args.promote_threshold:
             champion = model_copy(candidate, device)
             save_weights(candidate, args.champion)
             promoted = "  *** PROMOTED (champion updated) ***"
-        else:
+        elif win_rate >= 0:
             # Reset candidate to champion — don't let it drift away from the best known weights.
             candidate.load_state_dict(champion.state_dict())
             candidate = candidate.to(device)
@@ -517,7 +588,7 @@ def main():
             f"iter {it:>4}/{args.iters}  "
             f"buf {len(replay):>6}  new {new_samples:>4}  "
             f"loss {mean_loss:.4f} (pol {mean_pol:.4f} val {mean_val:.4f})  "
-            f"winrate {win_rate:.1%}  "
+            f"winrate {win_rate:.1%}  " if win_rate >= 0 else "winrate —       "
             f"{it_secs:.0f}s  elapsed {elapsed:.0f}s"
             f"{promoted}",
             flush=True,
