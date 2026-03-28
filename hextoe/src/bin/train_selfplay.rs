@@ -295,11 +295,13 @@ fn main() {
                     None    => vb_d += 1,
                 }
             }
-            let vs_best_rate = vb_w as f64 / eval_games as f64;
+            // Promotion uses decisive-game win rate (W/(W+L)) to avoid draw dilution.
+            let vb_decisive = (vb_w + vb_l) as f64;
+            let vs_best_rate = if vb_decisive > 0.0 { vb_w as f64 / vb_decisive } else { 0.5 };
 
             println!(
                 "  ── EVAL  vs-naive {:.1}% (W:{vn_w}/L:{vn_l}/D:{vn_d})  \
-                 vs-best {:.1}% (W:{vb_w}/L:{vb_l}/D:{vb_d})  \
+                 vs-best {:.1}% decisive (W:{vb_w}/L:{vb_l}/D:{vb_d})  \
                  streak {promote_streak}/{promote_streak_req}  ({:.0}s total)",
                 naive_rate * 100.0, vs_best_rate * 100.0,
                 t_total.elapsed().as_secs_f64()
