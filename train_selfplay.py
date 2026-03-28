@@ -272,25 +272,37 @@ def _expand(node, model, device):
     """Expand node by evaluating with network (used for root priming)."""
     if node.expanded:
         return
-    node.expanded = True
     actions = node.state.legal_actions()
     if not actions:
+        node.expanded = True
         return
     probs, _ = net_eval(model, node.state, device)
-    _expand_with_probs(node, probs)
+    _expand_with_probs(node, probs)  # sets node.expanded = True
 
+
+TACTICAL_BLEND = 0.5  # weight given to tactical priors when threats exist (0 = NN only, 1 = tactical only)
 
 def _expand_with_probs(node, probs):
-    """Expand node using pre-computed policy probabilities (batch path)."""
+    """Expand node using NN policy probs, blended with tactical heuristics when threats exist."""
     if node.expanded:
         return
     node.expanded = True
     actions = node.state.legal_actions()
     if not actions:
         return
+
+    # Get tactical priors from Rust (empty list when position is quiet).
+    tac_list = node.state.tactical_priors()
+    tac = dict(tac_list) if tac_list else {}
+
     for action in actions:
         idx = node.state.action_to_index(action[0], action[1])
-        prior = float(probs[idx]) if 0 <= idx < G2 else 1.0 / len(actions)
+        nn_prior = float(probs[idx]) if 0 <= idx < G2 else 1.0 / len(actions)
+        if tac:
+            tac_prior = tac.get(action, 0.0)
+            prior = (1.0 - TACTICAL_BLEND) * nn_prior + TACTICAL_BLEND * tac_prior
+        else:
+            prior = nn_prior
         child_state = node.state.clone()
         child_state.place(action[0], action[1])
         node.children[action] = MCTSNode(child_state, prior=prior)

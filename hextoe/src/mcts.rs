@@ -136,7 +136,7 @@ pub fn naive_best_move(state: &GameState) -> Option<Pos> {
 ///   N == 0-1 → base weights are fine
 ///   N == 2   → both pair moves must block; suppress everything else
 ///   N >= 3   → can't block all; only immediate wins and own-5-threats matter
-pub(crate) fn compound_threat_priors(
+pub fn compound_threat_priors(
     state: &GameState,
     actions: &[Pos],
     me: Player,
