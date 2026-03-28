@@ -1,16 +1,18 @@
 //! NNUE value estimator — pure-CPU inference for game-level parallelism in self-play.
 //!
 //! Architecture (value-only, no policy head):
-//!   sparse binary input (938 features) → L1 (256, ClippedReLU)
-//!     → L2 (32, ClippedReLU) → L3 (16, ClippedReLU) → tanh scalar output
+//!   sparse binary input (1_264 features) → L1 (512, ClippedReLU)
+//!     → L2 (64, ClippedReLU) → L3 (32, ClippedReLU) → tanh scalar output
 //!
 //! The accumulator for L1 is `bias + Σ active_feature_columns`, so adding or
 //! removing a piece from the board only updates one column — O(L1_SIZE) work
 //! instead of O(N_FEATURES × L1_SIZE).
 //!
 //! Feature encoding (always from X's perspective):
-//!   Feature i         = X piece at relative cell i   (i < N_CELLS)
-//!   Feature N_CELLS+i = O piece at relative cell i
+//!   Feature i               = X piece at relative cell i   (i < N_CELLS)
+//!   Feature N_CELLS+i       = O piece at relative cell i
+//!   Feature 2*N_CELLS + 0   = 1 if X is to move
+//!   Feature 2*N_CELLS + 1   = 1 if this is the 2nd move of the current player's pair
 //!   "relative" = offset from board centroid, within hex-radius NNUE_RADIUS.
 //!
 //! Output is value from X's perspective; negate for O as root_player.
@@ -33,14 +35,16 @@ use crate::mcts::{move_weight, RolloutPolicy};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-pub const NNUE_RADIUS: i32 = 12;
-/// Hex cells within radius 12: 1 + 3·12·13 = 469.
+pub const NNUE_RADIUS: i32 = 14;
+/// Hex cells within radius 14: 1 + 3·14·15 = 631.
 pub const N_CELLS: usize = 1 + 3 * (NNUE_RADIUS as usize) * (NNUE_RADIUS as usize + 1);
-/// One feature per (cell, player) pair.
-pub const N_FEATURES: usize = N_CELLS * 2;
-pub const L1_SIZE: usize = 256;
-pub const L2_SIZE: usize = 32;
-pub const L3_SIZE: usize = 16;
+/// Two turn-indicator features: "X to move" and "2nd of pair".
+pub const N_TURN_FEATURES: usize = 2;
+/// One feature per (cell, player) pair, plus turn indicators.
+pub const N_FEATURES: usize = N_CELLS * 2 + N_TURN_FEATURES;
+pub const L1_SIZE: usize = 512;
+pub const L2_SIZE: usize = 64;
+pub const L3_SIZE: usize = 32;
 
 pub const DEFAULT_NNUE_PATH: &str = "nnue_model.safetensors";
 
@@ -70,17 +74,27 @@ fn cell_table() -> &'static HashMap<Pos, usize> {
 
 /// Return the active feature indices for `state`, relative to `center`.
 ///
-/// Pieces outside NNUE_RADIUS of `center` are silently dropped (rare in practice).
-/// Features 0..N_CELLS = X pieces; N_CELLS..2*N_CELLS = O pieces.
+/// Pieces outside NNUE_RADIUS of `center` are silently dropped.
+/// Features 0..N_CELLS            = X pieces
+/// Features N_CELLS..2*N_CELLS    = O pieces
+/// Feature  2*N_CELLS + 0         = 1 if X is to move
+/// Feature  2*N_CELLS + 1         = 1 if this is the 2nd move of the current pair
 pub fn encode_nnue(state: &GameState, center: Pos) -> Vec<usize> {
     let table = cell_table();
-    let mut features = Vec::with_capacity(state.board.len());
+    let mut features = Vec::with_capacity(state.board.len() + N_TURN_FEATURES);
     for (&(q, r), &player) in &state.board {
         let rel = (q - center.0, r - center.1);
         if let Some(&cell_idx) = table.get(&rel) {
             let offset = if player == Player::X { 0 } else { N_CELLS };
             features.push(offset + cell_idx);
         }
+    }
+    // Turn indicator features.
+    if state.current_player() == Player::X {
+        features.push(N_CELLS * 2);       // "X to move"
+    }
+    if state.total_moves > 0 && (state.total_moves - 1) % 2 == 1 {
+        features.push(N_CELLS * 2 + 1);   // "2nd move of current pair"
     }
     features.sort_unstable();
     features
