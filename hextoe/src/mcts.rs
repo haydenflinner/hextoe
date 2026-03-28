@@ -91,7 +91,7 @@ pub(crate) fn move_weight(
     } else if my_max >= 5 {
         50.0
     } else if op_max >= 4 {
-        60.0   // must block — opp goes 4→5→6 next pair
+        200.0  // must block — opp goes 4→5→6 next pair (pair-move: one-pair kill)
     } else if my_axes3 >= 2 {
         30.0
     } else if op_axes3 >= 2 {
