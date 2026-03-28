@@ -152,7 +152,42 @@ impl NNUENet {
         self.fc3.forward(&x)?.tanh()
     }
 
+    /// Sparse forward pass — avoids the O(batch × N_FEATURES) dense matmul by
+    /// summing only the active feature columns of fc0.weight for each sample.
+    ///
+    /// With N_FEATURES = 22K but only ~400 active features per position, this is
+    /// ~50× faster than `forward(dense_from_sparse(...))` at the L1 step.
+    pub fn forward_sparse(&self, features_batch: &[Vec<usize>], device: &Device) -> CResult<Tensor> {
+        let b = features_batch.len();
+        // fc0.weight is [L1_SIZE, N_FEATURES]; transpose to [N_FEATURES, L1_SIZE]
+        // so we can index_select rows by active feature index.
+        let w0_t = self.fc0.weight().t()?;
+        let b0 = self.fc0.bias().expect("fc0 bias required");
+
+        let mut l1_rows: Vec<Tensor> = Vec::with_capacity(b);
+        for feats in features_batch {
+            let row = if feats.is_empty() {
+                b0.unsqueeze(0)?
+            } else {
+                let idx = Tensor::from_vec(
+                    feats.iter().map(|&f| f as u32).collect::<Vec<_>>(),
+                    (feats.len(),),
+                    device,
+                )?;
+                // [n_active, L1_SIZE] → sum → [L1_SIZE] → add bias → [1, L1_SIZE]
+                (w0_t.index_select(&idx, 0)?.sum(0)? + b0)?.unsqueeze(0)?
+            };
+            l1_rows.push(row.clamp(0f32, 1f32)?);
+        }
+
+        let l1 = Tensor::cat(&l1_rows, 0)?;   // [batch, L1_SIZE]
+        let l2 = self.fc1.forward(&l1)?.clamp(0f32, 1f32)?;
+        let l3 = self.fc2.forward(&l2)?.clamp(0f32, 1f32)?;
+        self.fc3.forward(&l3)?.tanh()
+    }
+
     /// Build a dense `[batch, N_FEATURES]` tensor from a batch of sparse feature lists.
+    /// Kept for compatibility; prefer `forward_sparse` for training.
     pub fn dense_from_sparse(features_batch: &[Vec<usize>], device: &Device) -> CResult<Tensor> {
         let batch = features_batch.len();
         let mut data = vec![0.0f32; batch * N_FEATURES];

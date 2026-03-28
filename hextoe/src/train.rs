@@ -1211,10 +1211,11 @@ pub fn nnue_train_step(
 
     // Always train NNUE on CPU regardless of the CNN device.
     let cpu = Device::Cpu;
-    let input = NNUENet::dense_from_sparse(&features_batch, &cpu)?;
     let target = Tensor::from_slice(&z_data, (b, 1usize), &cpu)?;
 
-    let output = net.forward(&input)?;
+    // Sparse forward: only touches active feature columns of fc0.weight (~50× faster
+    // than dense_from_sparse + forward when N_FEATURES is large).
+    let output = net.forward_sparse(&features_batch, &cpu)?;
     let loss = (&output - &target)?.sqr()?.mean_all()?;
     opt.backward_step(&loss)?;
 
