@@ -409,7 +409,7 @@ def train_step(model, batch, opt, device):
     log_p = F.log_softmax(logits, dim=1)
     policy_loss = -(policies * log_p).sum(dim=1).mean()
     value_loss = F.mse_loss(value_out, values)
-    loss = policy_loss + 4.0 * value_loss
+    loss = policy_loss + 1.0 * value_loss
 
     opt.zero_grad()
     loss.backward()
@@ -471,9 +471,9 @@ def main():
     ap.add_argument("--lr",                 type=float, default=3e-4)
     ap.add_argument("--mcts-batch",         type=int,   default=8,
                     help="Leaves evaluated per network call inside MCTS (higher = faster GPU)")
-    ap.add_argument("--max-moves",          type=int,   default=120,
+    ap.add_argument("--max-moves",          type=int,   default=300,
                     help="Terminate games after this many moves (prevents runaway games)")
-    ap.add_argument("--eval-every",         type=int,   default=1,
+    ap.add_argument("--eval-every",         type=int,   default=5,
                     help="Run champion evaluation every N iterations")
     ap.add_argument("--batch",              type=int,   default=256)
     ap.add_argument("--train-steps",        type=int,   default=200)
@@ -587,12 +587,7 @@ def main():
             save_weights(candidate, args.champion)
             promoted = "  *** PROMOTED (champion updated) ***"
         elif win_rate >= 0:
-            # Reset candidate to champion — don't let it drift away from the best known weights.
-            candidate.load_state_dict(champion.state_dict())
-            candidate = candidate.to(device)
-            opt = torch.optim.AdamW(candidate.parameters(), lr=args.lr, weight_decay=1e-4)
-            replay.clear()
-            promoted = "  (reset to champion)"
+            promoted = "  (no promote — continuing)"
 
         elapsed = time.time() - t0
         it_secs = time.time() - it_t0
