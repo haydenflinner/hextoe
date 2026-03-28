@@ -167,14 +167,16 @@ fn count_axis(board: &HashMap<Pos, Player>, pos: Pos, player: Player, dq: i32, d
 /// Maximum consecutive `player` run through `pos` across all three axes,
 /// treating `pos` as if occupied by `player` (regardless of its actual state).
 ///
+/// Same as taking the max of [`runs_per_axis`] — each [`count_axis`] already includes the
+/// hypothetical stone at `pos` (counter starts at 1).
+///
 /// Use this to evaluate "how good would it be to place at `pos`?":
 /// - returns ≥ 6 → placing here wins immediately
 /// - returns 5 → extends to a 5-in-a-row (one step from winning)
 /// - returns 4 → extends to a 4-in-a-row, etc.
 pub fn max_run_through(board: &HashMap<Pos, Player>, pos: Pos, player: Player) -> u32 {
-    WIN_AXES
-        .iter()
-        .map(|&(dq, dr)| count_axis(board, pos, player, dq, dr) + 1)
+    runs_per_axis(board, pos, player)
+        .into_iter()
         .max()
         .unwrap_or(0)
 }
@@ -192,6 +194,47 @@ pub fn runs_per_axis(board: &HashMap<Pos, Player>, pos: Pos, player: Player) -> 
         count_axis(board, pos, player, WIN_AXES[1].0, WIN_AXES[1].1),
         count_axis(board, pos, player, WIN_AXES[2].0, WIN_AXES[2].1),
     ]
+}
+
+/// Empty cells that are the immediate extension of a **straight** opponent run of length ≥ 4
+/// along one of [`WIN_AXES`]. Playing there is required to stop that line from becoming five
+/// on the next opponent stone along the axis (critical under pair-move tempo).
+///
+/// This catches endpoint blocks even if other heuristics mis-score the same cell (e.g. when
+/// several tactical signals compete on one intersection).
+pub fn opp_straight_extension_blocks(board: &HashMap<Pos, Player>, opp: Player) -> HashSet<Pos> {
+    let mut out = HashSet::new();
+    for &(dq, dr) in &WIN_AXES {
+        for &start in board.keys() {
+            if board.get(&start) != Some(&opp) {
+                continue;
+            }
+            let prev = (start.0 - dq, start.1 - dr);
+            if board.get(&prev) == Some(&opp) {
+                continue;
+            }
+            let mut len = 1u32;
+            let (mut q, mut r) = (start.0 + dq, start.1 + dr);
+            let mut end = start;
+            while board.get(&(q, r)) == Some(&opp) {
+                len += 1;
+                end = (q, r);
+                q += dq;
+                r += dr;
+            }
+            if len >= 4 {
+                let before = (start.0 - dq, start.1 - dr);
+                let after = (end.0 + dq, end.1 + dr);
+                if !board.contains_key(&before) {
+                    out.insert(before);
+                }
+                if !board.contains_key(&after) {
+                    out.insert(after);
+                }
+            }
+        }
+    }
+    out
 }
 
 pub fn check_win(board: &HashMap<Pos, Player>, pos: Pos, player: Player) -> bool {
@@ -359,6 +402,30 @@ mod tests {
         let mut g = GameState::new();
         assert!(g.place((0, 0)));
         assert!(!g.place((0, 0))); // duplicate → rejected
+    }
+
+    #[test]
+    fn max_run_through_matches_hypothetical_line_length() {
+        let mut board = HashMap::new();
+        for i in 1..=4 {
+            board.insert((i, 0), Player::O);
+        }
+        // Empty at (5,0): completing O's line there gives length 5, not 6.
+        assert_eq!(max_run_through(&board, (5, 0), Player::O), 5);
+        // Immediate win: five Os one side of empty (6th cell).
+        board.insert((5, 0), Player::O);
+        assert_eq!(max_run_through(&board, (6, 0), Player::O), 6);
+    }
+
+    #[test]
+    fn opp_straight_extension_blocks_endpoints_of_four() {
+        let mut board = HashMap::new();
+        for i in 1..=4 {
+            board.insert((i, 0), Player::O);
+        }
+        let b = opp_straight_extension_blocks(&board, Player::O);
+        assert!(b.contains(&(0, 0)), "open end before segment");
+        assert!(b.contains(&(5, 0)), "open end after segment");
     }
 
     #[test]

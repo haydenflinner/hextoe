@@ -6,9 +6,10 @@
 ///   enumeration never rescans the full board.
 /// - Rewards are stored from a fixed root-player perspective, avoiding
 ///   per-level sign bookkeeping that breaks for 2-moves-per-turn games.
-use crate::game::{max_run_through, runs_per_axis, GameState, Player, Pos};
+use crate::game::{max_run_through, opp_straight_extension_blocks, runs_per_axis, GameState, Player, Pos};
 use rand::Rng;
 use rayon::prelude::*;
+use std::collections::HashSet;
 
 /// Exploration constant for UCB1 (random rollout path).
 const C: f32 = std::f32::consts::SQRT_2;
@@ -69,11 +70,15 @@ pub trait RolloutPolicy {
 ///     5 — create 3-in-a-row on any axis
 ///     4 — block opp 3-in-a-row
 ///     1 — normal move
-pub fn move_weight(
+///
+/// `straight_opp_blocks` should be [`opp_straight_extension_blocks`] for this `board` and
+/// `opp` (reuse one set per position when scoring many cells).
+fn move_weight_core(
     board: &std::collections::HashMap<crate::game::Pos, crate::game::Player>,
     pos: crate::game::Pos,
     me: crate::game::Player,
     opp: crate::game::Player,
+    straight_opp_blocks: &HashSet<Pos>,
 ) -> f32 {
     let my_runs = runs_per_axis(board, pos, me);
     let op_runs = runs_per_axis(board, pos, opp);
@@ -81,6 +86,7 @@ pub fn move_weight(
     let op_max = op_runs.iter().copied().max().unwrap_or(0);
     let my_axes3 = my_runs.iter().filter(|&&r| r >= 3).count();
     let op_axes3 = op_runs.iter().filter(|&&r| r >= 3).count();
+    let blocks_straight_four = straight_opp_blocks.contains(&pos);
 
     if my_max >= 6 {
         1000.0
@@ -88,10 +94,10 @@ pub fn move_weight(
         800.0
     } else if op_max >= 5 {
         300.0  // must block — opp wins with 2nd move of pair
+    } else if op_max >= 4 || blocks_straight_four {
+        200.0  // must block — opp goes 4→5→6 next pair (pair-move: one-pair kill)
     } else if my_max >= 5 {
         50.0
-    } else if op_max >= 4 {
-        200.0  // must block — opp goes 4→5→6 next pair (pair-move: one-pair kill)
     } else if my_axes3 >= 2 {
         30.0
     } else if op_axes3 >= 2 {
@@ -107,6 +113,16 @@ pub fn move_weight(
     }
 }
 
+pub fn move_weight(
+    board: &std::collections::HashMap<crate::game::Pos, crate::game::Player>,
+    pos: crate::game::Pos,
+    me: crate::game::Player,
+    opp: crate::game::Player,
+) -> f32 {
+    let blocks = opp_straight_extension_blocks(board, opp);
+    move_weight_core(board, pos, me, opp, &blocks)
+}
+
 /// Pick the best tactical move for the naive player using `move_weight` heuristics.
 /// Returns `None` only when there are no legal actions.
 pub fn naive_best_move(state: &GameState) -> Option<Pos> {
@@ -116,12 +132,13 @@ pub fn naive_best_move(state: &GameState) -> Option<Pos> {
     }
     let me = state.current_player();
     let opp = me.other();
+    let straight_blocks = opp_straight_extension_blocks(&state.board, opp);
     actions
         .iter()
         .copied()
         .max_by(|&a, &b| {
-            move_weight(&state.board, a, me, opp)
-                .partial_cmp(&move_weight(&state.board, b, me, opp))
+            move_weight_core(&state.board, a, me, opp, &straight_blocks)
+                .partial_cmp(&move_weight_core(&state.board, b, me, opp, &straight_blocks))
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
 }
@@ -135,7 +152,9 @@ pub fn naive_best_move(state: &GameState) -> Option<Pos> {
 ///
 ///   N == 0-1 → base weights are fine
 ///   N == 2   → both pair moves must block; suppress everything else
-///   N >= 3   → can't block all; only immediate wins and own-5-threats matter
+///   N >= 3   → can't block all five-extensions; still boost obvious **straight-four**
+///              extension blocks — they are not in `critical` (which is opp run ≥ 5 at `pos`)
+///              and were incorrectly squashed to 1.0, destroying PUCT.
 pub fn compound_threat_priors(
     state: &GameState,
     actions: &[Pos],
@@ -143,6 +162,7 @@ pub fn compound_threat_priors(
     opp: Player,
 ) -> Vec<(Pos, f32)> {
     // One-time board scan: positions where opp placing creates a run ≥ 5.
+    let straight_blocks = opp_straight_extension_blocks(&state.board, opp);
     let critical: std::collections::HashSet<Pos> = state.candidates.iter()
         .filter(|&&p| !state.board.contains_key(&p))
         .filter(|&&p| max_run_through(&state.board, p, opp) >= 5)
@@ -150,8 +170,11 @@ pub fn compound_threat_priors(
         .collect();
     let n = critical.len();
 
+    /// Prior weight for blocking an opponent straight run of 4+ when many five-threats exist.
+    const STRAIGHT_FOUR_BLOCK_PRIOR: f32 = 280.0;
+
     actions.iter().map(|&pos| {
-        let base = move_weight(&state.board, pos, me, opp);
+        let base = move_weight_core(&state.board, pos, me, opp, &straight_blocks);
         let w = if n >= 3 {
             // Can't block all threats with one pair → offense-or-die.
             if base >= 1000.0 {
@@ -162,6 +185,9 @@ pub fn compound_threat_priors(
                 600.0 // create own 5-threat: forces opp to defend, races their win
             } else if critical.contains(&pos) {
                 300.0 // block one critical point (buys time, pair-mate still threatens)
+            } else if straight_blocks.contains(&pos) {
+                // Still defend open four — do not flatten to 1.0 or MCTS ignores obvious blocks.
+                STRAIGHT_FOUR_BLOCK_PRIOR
             } else {
                 1.0
             }
@@ -176,6 +202,8 @@ pub fn compound_threat_priors(
                 base.max(500.0)
             } else if critical.contains(&pos) {
                 base  // keep the 300 from move_weight
+            } else if straight_blocks.contains(&pos) {
+                base.max(STRAIGHT_FOUR_BLOCK_PRIOR)
             } else {
                 1.0   // everything else is irrelevant this pair
             }
@@ -895,5 +923,64 @@ mod tests {
         let n = &m.nodes[id];
         assert!(n.visits > 0, "child {pos:?} never visited");
         n.total_value / n.visits as f32
+    }
+
+    #[test]
+    fn block_straight_four_endpoint_outranks_scattered_development() {
+        use std::collections::HashMap;
+        let mut board = HashMap::new();
+        for i in 1..=4 {
+            board.insert((i, 0), Player::O);
+        }
+        board.insert((0, 8), Player::X);
+        board.insert((1, 8), Player::X);
+        board.insert((2, 8), Player::X);
+        let blocks = crate::game::opp_straight_extension_blocks(&board, Player::O);
+        let me = Player::X;
+        let opp = Player::O;
+        let w_block = move_weight_core(&board, (5, 0), me, opp, &blocks);
+        let w_extend_self = move_weight_core(&board, (3, 8), me, opp, &blocks);
+        assert!(
+            w_block > w_extend_self,
+            "must block O's open four before extending own shape: block {w_block} vs extend {w_extend_self}"
+        );
+        assert!(w_block >= 200.0, "endpoint block tier: {w_block}");
+    }
+
+    #[test]
+    fn compound_threat_does_not_flatten_straight_four_when_n_ge_3() {
+        // O has an open four on (1,0)..(4,0); X to move. Add three far-away X stones so O
+        // has three distinct empty five-extension points (critical.len() >= 3).
+        let cells = vec![
+            ((1, 0), Player::O),
+            ((2, 0), Player::O),
+            ((3, 0), Player::O),
+            ((4, 0), Player::O),
+            ((0, 15), Player::X),
+            ((1, 15), Player::X),
+            ((2, 15), Player::X),
+            ((3, 15), Player::X),
+            ((0, -15), Player::X),
+            ((1, -15), Player::X),
+            ((2, -15), Player::X),
+            ((3, -15), Player::X),
+            ((15, 0), Player::X),
+            ((16, 0), Player::X),
+            ((17, 0), Player::X),
+            ((18, 0), Player::X),
+        ];
+        let state = GameState::from_cells(&cells, cells.len() as u32);
+        assert_eq!(state.current_player(), Player::X);
+        let actions = state.legal_actions();
+        let priors = compound_threat_priors(&state, &actions, Player::X, Player::O);
+        let w_open_four_tip = priors
+            .iter()
+            .find(|(p, _)| *p == (5, 0))
+            .map(|(_, w)| *w)
+            .expect("(5,0) should be legal");
+        assert!(
+            w_open_four_tip > 10.0,
+            "open-four extension must keep a strong prior when n>=3, got {w_open_four_tip}"
+        );
     }
 }
