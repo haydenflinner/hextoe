@@ -1,7 +1,7 @@
 //! Supervised pre-training from online game data (JSON).
 //!
 //! Usage:
-//!   hextoe-pretrain <games1.json> [games2.json ...] [--epochs N] [--batch-size B] [--lr LR] [--out path]
+//!   hextoe-pretrain <games1.json> [games2.json ...] [--epochs N] [--batch-size B] [--lr LR] [--out path] [--cpu]
 //!
 //! Accepts one or more JSON files (pass a shell glob and the shell will expand it).
 //! Loads compact raw move lists (not pre-expanded ×12 symmetries), builds a sample index,
@@ -12,6 +12,7 @@
 use std::path::Path;
 use std::time::Instant;
 
+use candle_core::Device;
 use candle_nn::optim::{AdamW, ParamsAdamW};
 use candle_nn::Optimizer;
 use rand::seq::SliceRandom;
@@ -27,7 +28,7 @@ use hextoe::train::{train_step, DEFAULT_BEST_PATH, DEFAULT_LATEST_PATH};
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 || args[1].starts_with('-') {
-        eprintln!("Usage: hextoe-pretrain <games1.json> [games2.json ...] [--epochs N] [--batch-size B] [--lr LR] [--out path]");
+        eprintln!("Usage: hextoe-pretrain <games1.json> [games2.json ...] [--epochs N] [--batch-size B] [--lr LR] [--out path] [--cpu]");
         std::process::exit(1);
     }
 
@@ -41,6 +42,7 @@ fn main() {
     let batch_size = parse_arg(&args, "--batch-size", 128usize);
     let lr = parse_arg_f64(&args, "--lr", 3e-4);
     let out_path = parse_arg_str(&args, "--out", DEFAULT_BEST_PATH);
+    let force_cpu = args.iter().any(|a| a == "--cpu");
 
     println!("Loading game data from {} file(s)…", json_paths.len());
     let (games, used, skipped) = match load_raw_games_multi(&json_paths) {
@@ -57,8 +59,19 @@ fn main() {
         std::process::exit(1);
     }
 
-    let device = default_inference_device();
-    println!("Device: {device:?}");
+    let pairs_bytes = sample_pairs.len() * std::mem::size_of::<(usize, usize)>();
+    let moves_bytes: usize = games.iter().map(|g| g.moves.len() * std::mem::size_of::<(i32, i32)>()).sum();
+    println!(
+        "Host dataset (CPU): ~{:.2} MiB (sample index + move lists). This is separate from GPU/Metal memory Activity Monitor may attribute to the process.",
+        (pairs_bytes + moves_bytes) as f64 / (1024.0 * 1024.0)
+    );
+
+    let device = if force_cpu {
+        Device::Cpu
+    } else {
+        default_inference_device()
+    };
+    println!("Device: {device:?}{}", if force_cpu { " (--cpu)" } else { "" });
 
     let (mut varmap, model) = build_model(&device).expect("build model");
 
