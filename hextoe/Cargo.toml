@@ -36,6 +36,7 @@ name = "hextoe-train-selfplay"
 path = "src/bin/train_selfplay.rs"
 
 [dependencies]
+ctrlc = "3"
 rayon = "1.10"
 eframe = "0.28"
 egui = "0.28"

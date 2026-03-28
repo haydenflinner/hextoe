@@ -6,6 +6,9 @@
 //!
 //! Hyperparameters: edit `DEFAULT_*` in `hextoe::train` (`src/train.rs`).
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use hextoe::train::{cli_one_checkpoint, run_training, TrainingConfig};
 
 fn main() {
@@ -21,11 +24,24 @@ fn main() {
         return;
     }
 
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel_clone = cancel.clone();
+    ctrlc::set_handler(move || {
+        if cancel_clone.load(Ordering::Relaxed) {
+            // Second CTRL+C: force-quit immediately.
+            eprintln!("\nForce-quitting.");
+            std::process::exit(1);
+        }
+        eprintln!("\nCTRL+C received — finishing current phase then saving. Press again to force-quit.");
+        cancel_clone.store(true, Ordering::Relaxed);
+    })
+    .expect("Error setting CTRL+C handler");
+
     if let Err(e) = run_training(
         TrainingConfig::default_with_cli_rollout(),
         None,
         true,
-        None,
+        Some(cancel),
         cli_one_checkpoint(),
     ) {
         eprintln!("Fatal error: {e}");

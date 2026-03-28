@@ -785,6 +785,20 @@ fn run_population_training(
     Ok(())
 }
 
+/// Save `latest_path` when training is interrupted. Logs success or failure.
+fn save_on_cancel(
+    varmap: &VarMap,
+    config: &TrainingConfig,
+    monitor: &Option<Arc<Mutex<TrainingMonitor>>>,
+    log_stdout: bool,
+) {
+    let mut vm = varmap.clone();
+    match save_weights(&mut vm, &config.latest_path) {
+        Ok(()) => log_line(monitor, log_stdout, &format!("  Saved weights → {}", config.latest_path)),
+        Err(e) => log_line(monitor, log_stdout, &format!("  Warning: could not save weights: {e}")),
+    }
+}
+
 fn io_to_candle(e: std::io::Error) -> candle_core::Error {
     candle_core::Error::Msg(format!("{e}"))
 }
@@ -870,6 +884,7 @@ pub fn run_training(
     loop {
         if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
             log_line(&monitor, log_stdout, "Training stopped by user.");
+            save_on_cancel(&varmap, &config, &monitor, log_stdout);
             break;
         }
 
@@ -932,6 +947,7 @@ pub fn run_training(
 
         if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
             log_line(&monitor, log_stdout, "Training stopped by user.");
+            save_on_cancel(&varmap, &config, &monitor, log_stdout);
             break;
         }
 
