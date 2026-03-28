@@ -11,12 +11,15 @@
 //!   ←/→ arrow keys or buttons — step through moves
 //!   Click a move in the list  — jump to that move
 //!   Scroll/pinch              — zoom the board
+//!   Export JSON… / Copy JSON  — dump current board + legal moves + heuristics + `from_cells`
+//!                                 snippet (file is written to the process working directory)
 
 use eframe::egui;
 use egui::{Align2, Color32, FontId, Pos2, RichText, Stroke};
-use hextoe::game::{winning_line, GameState, Player, Pos};
-use hextoe::mcts::{Mcts, TacticalRollout};
+use hextoe::game::{opp_straight_extension_blocks, winning_line, GameState, Player, Pos};
+use hextoe::mcts::{naive_best_move, Mcts, TacticalRollout};
 use serde::Deserialize;
+use serde_json::json;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
@@ -243,6 +246,8 @@ struct ReplayApp {
     game_idx: usize,
     /// Current move index (0 = board before any moves; step N shows state after N moves).
     move_idx: usize,
+    /// Path passed on the command line (for export metadata).
+    source_json_path: String,
 
     analysis: Option<Analysis>,
     cancel: Arc<AtomicBool>,
@@ -250,19 +255,23 @@ struct ReplayApp {
 
     pan_offset: egui::Vec2,
     hex_size: f32,
+    /// Last export / copy status for the user.
+    export_status: Option<String>,
 }
 
 impl ReplayApp {
-    fn new(games: Vec<ReplayGame>, start_game: usize) -> Self {
+    fn new(games: Vec<ReplayGame>, start_game: usize, source_json_path: String) -> Self {
         let mut app = ReplayApp {
             games,
             game_idx: start_game,
             move_idx: 0,
+            source_json_path,
             analysis: None,
             cancel: Arc::new(AtomicBool::new(false)),
             result_rx: None,
             pan_offset: egui::Vec2::ZERO,
             hex_size: 28.0,
+            export_status: None,
         };
         app.restart_analysis();
         app
@@ -444,6 +453,7 @@ impl eframe::App for ReplayApp {
         let mut zoom_action: Option<(Pos2, f32)> = None;
         let mut scroll_delta = egui::Vec2::ZERO;
         let mut list_hover_pos: Option<Pos> = None;
+        let export_note = self.export_status.clone();
 
         // ── Left panel: game list ──────────────────────────────────────────
         egui::SidePanel::left("games")
@@ -462,8 +472,11 @@ impl eframe::App for ReplayApp {
             });
 
         // ── Right panel: analysis ──────────────────────────────────────────
+        let mut export_to_file = false;
+        let mut copy_json = false;
+
         egui::SidePanel::right("analysis")
-            .exact_width(240.0)
+            .exact_width(280.0)
             .show(ctx, |ui| {
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
@@ -565,6 +578,27 @@ impl eframe::App for ReplayApp {
                 ui.label(RichText::new("Controls").strong());
                 ui.label("← → arrow keys or buttons");
                 ui.label("Click timeline to jump");
+                ui.separator();
+                ui.label(RichText::new("Export").strong());
+                ui.horizontal(|ui| {
+                    if ui
+                        .button("Export JSON…")
+                        .on_hover_text("Write hextoe_replay_export_gameN_moveM.json in the current working directory")
+                        .clicked()
+                    {
+                        export_to_file = true;
+                    }
+                    if ui
+                        .button("Copy JSON")
+                        .on_hover_text("Full snapshot for tests, issues, or sharing")
+                        .clicked()
+                    {
+                        copy_json = true;
+                    }
+                });
+                if let Some(ref n) = export_note {
+                    ui.label(RichText::new(n).small().weak());
+                }
             });
 
         // ── Bottom panel: move timeline ────────────────────────────────────
@@ -701,6 +735,36 @@ impl eframe::App for ReplayApp {
         if nav_bck { self.step_back(); }
         if let Some(i) = move_select { self.go_to_move(i); }
         if let Some(i) = game_select { self.go_to_game(i); }
+
+        if export_to_file || copy_json {
+            let payload = build_export_payload(
+                &self.source_json_path,
+                self.game(),
+                game_idx,
+                move_idx,
+                &board_state,
+                analysis_snapshot.as_ref(),
+            );
+            match serde_json::to_string_pretty(&payload) {
+                Ok(text) => {
+                    let mut parts: Vec<String> = Vec::new();
+                    if export_to_file {
+                        let fname =
+                            format!("hextoe_replay_export_game{}_move{}.json", game_idx + 1, move_idx);
+                        match std::fs::write(&fname, &text) {
+                            Ok(()) => parts.push(format!("Saved {fname} (process cwd).")),
+                            Err(e) => parts.push(format!("Could not write file: {e}.")),
+                        }
+                    }
+                    if copy_json {
+                        ctx.copy_text(text);
+                        parts.push("Copied JSON to clipboard.".into());
+                    }
+                    self.export_status = Some(parts.join(" "));
+                }
+                Err(e) => self.export_status = Some(format!("Serialize failed: {e}")),
+            }
+        }
     }
 }
 
@@ -708,6 +772,117 @@ fn fmt_iters(n: u32) -> String {
     if n >= 1_000_000 { format!("{:.1}M", n as f32 / 1_000_000.0) }
     else if n >= 1_000 { format!("{:.1}k", n as f32 / 1_000.0) }
     else { format!("{n}") }
+}
+
+fn player_label(p: Player) -> &'static str {
+    match p {
+        Player::X => "X",
+        Player::O => "O",
+    }
+}
+
+/// JSON + Rust snippet for regression tests and offline debugging.
+fn build_export_payload(
+    source_json_path: &str,
+    game: &ReplayGame,
+    game_idx: usize,
+    move_idx: usize,
+    state: &GameState,
+    analysis: Option<&Analysis>,
+) -> serde_json::Value {
+    let mut cell_entries: Vec<(Pos, Player)> =
+        state.board.iter().map(|(p, pl)| (*p, *pl)).collect();
+    cell_entries.sort_by_key(|(p, _)| (p.0, p.1));
+
+    let cells: Vec<serde_json::Value> = cell_entries
+        .iter()
+        .map(|(p, pl)| {
+            json!({
+                "x": p.0,
+                "y": p.1,
+                "player": player_label(*pl),
+            })
+        })
+        .collect();
+
+    let mut legal: Vec<Pos> = state.legal_actions();
+    legal.sort_by_key(|p| (p.0, p.1));
+    let legal_json: Vec<serde_json::Value> = legal.iter().map(|p| json!([p.0, p.1])).collect();
+
+    let opp = state.current_player().other();
+    let mut straight: Vec<Pos> = opp_straight_extension_blocks(&state.board, opp).into_iter().collect();
+    straight.sort_by_key(|p| (p.0, p.1));
+    let straight_json: Vec<serde_json::Value> = straight.iter().map(|p| json!([p.0, p.1])).collect();
+
+    let rust_cell_lines: Vec<String> = cell_entries
+        .iter()
+        .map(|(p, pl)| {
+            format!(
+                "    (({}, {}), Player::{}),",
+                p.0,
+                p.1,
+                player_label(*pl)
+            )
+        })
+        .collect();
+    let cp = state.current_player();
+    let rust_snippet = format!(
+        concat!(
+            "// Paste into a `#[test]` or bench (hextoe::game).\n",
+            "let cells: &[(Pos, Player)] = &[\n",
+            "{}\n",
+            "];\n",
+            "let total_moves = {}u32;\n",
+            "let state = GameState::from_cells(cells, total_moves);\n",
+            "assert_eq!(state.current_player(), Player::{});\n"
+        ),
+        rust_cell_lines.join("\n"),
+        state.total_moves,
+        player_label(cp),
+    );
+
+    let mcts_json = analysis.map(|a| {
+        json!({
+            "simulations": a.iters,
+            "top_by_visits": a.all_moves.iter().take(24).map(|(p, s, v, ps)| {
+                json!({
+                    "pos": [p.0, p.1],
+                    "mean_value_index": s,
+                    "visits": v,
+                    "visit_share": ps,
+                })
+            }).collect::<Vec<_>>(),
+        })
+    });
+
+    json!({
+        "meta": {
+            "source_json_file": source_json_path,
+            "game_list_index_0": game_idx,
+            "game_id": game.id,
+            "replay_move_index_0": move_idx,
+            "note": "Board is the position BEFORE the move at replay_move_index (same as analyser board).",
+            "player_x_display": game.player_names[0],
+            "player_o_display": game.player_names[1],
+        },
+        "game_state": {
+            "total_moves": state.total_moves,
+            "current_player": player_label(cp),
+            "turn_label": state.turn_label(),
+            "is_terminal": state.is_terminal(),
+            "winner": state.winner.map(|w| player_label(w)),
+            "legal_action_count": legal.len(),
+        },
+        "cells": cells,
+        "legal_actions": legal_json,
+        "debug_heuristics": {
+            "opponent_to_block": player_label(opp),
+            "opp_straight_extension_blocks": straight_json,
+            "naive_best_move": naive_best_move(state).map(|p| json!([p.0, p.1])),
+        },
+        "rust_from_cells_snippet": rust_snippet,
+        "mcts_snapshot": mcts_json,
+    })
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
@@ -734,6 +909,7 @@ fn main() -> eframe::Result<()> {
     println!("Loaded {} games from {path}", games.len());
 
     let start = start_game.min(games.len() - 1);
+    let source_path = args[1].clone();
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -746,6 +922,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Hextoe Replay",
         options,
-        Box::new(move |_cc| Ok(Box::new(ReplayApp::new(games, start)))),
+        Box::new(move |_cc| Ok(Box::new(ReplayApp::new(games, start, source_path)))),
     )
 }

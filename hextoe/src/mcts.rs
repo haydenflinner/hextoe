@@ -189,7 +189,9 @@ pub fn compound_threat_priors(
     /// When `n >= 3`, generic “critical” (opp five-extension) cells are noisy; **geometric**
     /// endpoints of an existing straight run of 4+ ([`opp_straight_extension_blocks`]) are a
     /// sharper signal and must outrank them so PUCT does not treat 50×300 ties as uniform.
-    const STRAIGHT_FOUR_BLOCK_PRIOR: f32 = 450.0;
+    /// Must be **above** the own-five-threat tier (600) below: an open straight four still loses
+    /// on the next pair if ignored, so it beats “start a 5-threat somewhere else”.
+    const STRAIGHT_FOUR_BLOCK_PRIOR: f32 = 750.0;
     const CRITICAL_FIVE_EXT_PRIOR: f32 = 300.0;
 
     actions.iter().map(|&pos| {
@@ -200,10 +202,10 @@ pub fn compound_threat_priors(
                 base  // my immediate win
             } else if base >= 800.0 {
                 base  // must still block opp's immediate win (op_max >= 6)
-            } else if max_run_through(&state.board, pos, me) >= 5 {
-                600.0 // create own 5-threat: forces opp to defend, races their win
             } else if straight_blocks.contains(&pos) {
                 STRAIGHT_FOUR_BLOCK_PRIOR
+            } else if max_run_through(&state.board, pos, me) >= 5 {
+                600.0 // create own 5-threat: forces opp to defend, races their win
             } else if critical.contains(&pos) {
                 CRITICAL_FIVE_EXT_PRIOR
             } else {
@@ -458,6 +460,38 @@ impl RolloutPolicy for TacticalRollout {
     }
 
     const PARALLEL_SAFE: bool = true;
+}
+
+/// Sample an index into `unexpanded` proportional to prior mass on those moves.
+/// Keeps first expansions aligned with PUCT; uniform fallback when all unexpanded priors are ~0.
+fn sample_unexpanded_index_weighted(unexpanded: &[Pos], priors: &[(Pos, f32)], rng: &mut impl Rng) -> usize {
+    let len = unexpanded.len();
+    if len <= 1 {
+        return 0;
+    }
+    let mut sum = 0.0f32;
+    let mut weights = Vec::with_capacity(len);
+    for &p in unexpanded {
+        let w = priors
+            .iter()
+            .find(|(pp, _)| *pp == p)
+            .map(|(_, pr)| *pr)
+            .unwrap_or(0.0);
+        sum += w;
+        weights.push(w);
+    }
+    if sum <= 1e-12 {
+        return rng.gen_range(0..len);
+    }
+    let t = rng.gen::<f32>() * sum;
+    let mut acc = 0.0f32;
+    for (i, &w) in weights.iter().enumerate() {
+        acc += w;
+        if t < acc || i + 1 == len {
+            return i;
+        }
+    }
+    len - 1
 }
 
 struct Node {
@@ -806,7 +840,11 @@ impl Mcts {
             }
         }
 
-        let idx = rng.gen_range(0..self.nodes[id].unexpanded.len());
+        let idx = if let Some(ref priors) = self.nodes[id].children_priors {
+            sample_unexpanded_index_weighted(&self.nodes[id].unexpanded, priors, rng)
+        } else {
+            rng.gen_range(0..self.nodes[id].unexpanded.len())
+        };
         let action = self.nodes[id].unexpanded.swap_remove(idx);
 
         // Look up the NN policy prior for this action. 0.0 → UCB1 used in ucb().
@@ -1019,6 +1057,50 @@ mod tests {
         assert!(
             w_open_four_tip > 10.0,
             "open-four extension must keep a strong prior when n>=3, got {w_open_four_tip}"
+        );
+    }
+
+    /// Replay export: O open four on q=-8 with tip (-8,-2); X must block. Heuristics flag it;
+    /// MCTS should concentrate visits on that move after prior-weighted expansion.
+    #[test]
+    fn replay_export_position_mcts_visits_block_most() {
+        let cells: &[(Pos, Player)] = &[
+            ((-9, 0), Player::O),
+            ((-9, 1), Player::X),
+            ((-9, 3), Player::O),
+            ((-8, -1), Player::O),
+            ((-8, 0), Player::O),
+            ((-8, 1), Player::O),
+            ((-8, 2), Player::O),
+            ((-8, 3), Player::X),
+            ((-7, -2), Player::X),
+            ((-7, -1), Player::X),
+            ((-7, 0), Player::X),
+            ((-7, 1), Player::O),
+            ((-5, 0), Player::X),
+            ((-2, 0), Player::O),
+            ((0, 0), Player::X),
+            ((1, 0), Player::X),
+            ((2, 0), Player::X),
+            ((4, 0), Player::O),
+            ((6, 0), Player::X),
+            ((8, 0), Player::O),
+        ];
+        let state = GameState::from_cells(cells, 20);
+        assert_eq!(state.current_player(), Player::X);
+        let block = (-8, -2);
+        assert!(state.legal_actions().contains(&block));
+
+        let mut m = Mcts::new(state);
+        let mut rng = StdRng::seed_from_u64(42);
+        let rollout = TacticalRollout;
+        m.search_iters_serial(6_000, &mut rng, &rollout);
+        let top = m.best_moves(1);
+        assert_eq!(
+            top[0].0, block,
+            "expected most-visited root child to be open-four block (-8,-2), got {:?} visits={}",
+            top[0],
+            top[0].2
         );
     }
 }
