@@ -24,6 +24,9 @@ use crate::symmetry::{apply_transform, transform_state};
 pub struct NnueRecord {
     pub feats: Vec<u16>,
     pub outcome: f32,
+    /// Index into the GRID×GRID policy plane of the move that was played.
+    /// `None` if the move fell outside the encoding window.
+    pub move_idx: Option<u16>,
 }
 
 /// Load one or more JSON files as [`NnueRecord`]s (no CNN state, no policy target).
@@ -87,14 +90,16 @@ fn process_game_nnue(game: &GameJson) -> Option<Vec<NnueRecord>> {
     if steps.is_empty() { return None; }
 
     let mut records = Vec::new();
-    for (snap, _pos, player) in &steps {
+    for (snap, pos, player) in &steps {
         let outcome = if *player == winner_player { 1.0f32 } else { -1.0f32 };
         for tid in 0u8..12 {
             let ts = transform_state(snap, tid);
             let tc = board_center(&ts);
             let feats: Vec<u16> = encode_nnue(&ts, tc).into_iter().map(|f| f as u16).collect();
             if !feats.is_empty() {
-                records.push(NnueRecord { feats, outcome });
+                let (tq, tr) = apply_transform(tid, pos.0, pos.1);
+                let move_idx = action_to_index((tq, tr), tc).map(|i| i as u16);
+                records.push(NnueRecord { feats, outcome, move_idx });
             }
         }
     }
