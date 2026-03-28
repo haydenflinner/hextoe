@@ -350,6 +350,7 @@ fn cell_fill(
     suggestion_rank: Option<usize>,
     hovered: Option<Pos>,
     policy_prior: f32,
+    list_hovered: bool,
 ) -> Color32 {
     if let Some(player) = game.board.get(&pos) {
         return if win_cells.contains(&pos) {
@@ -360,6 +361,9 @@ fn cell_fill(
         } else {
             player_dark(*player)
         };
+    }
+    if list_hovered {
+        return Color32::from_rgb(255, 210, 30); // bright gold — list hover highlight
     }
     if Some(pos) == hovered && !game.is_terminal() {
         return Color32::from_gray(95);
@@ -424,6 +428,9 @@ impl eframe::App for App {
             }
             ctx.request_repaint();
         }
+
+        // Track which suggestion pos the cursor is hovering in the text list.
+        let mut list_hover_pos: Option<Pos> = None;
 
         // ── Side panel ────────────────────────────────────────────────────
         egui::SidePanel::right("side")
@@ -564,17 +571,17 @@ impl eframe::App for App {
                             1 => Color32::from_rgb(130, 190, 45),
                             _ => Color32::from_rgb(175, 190, 45),
                         };
-                        ui.colored_label(
-                            col,
-                            format!(
-                                "{marker} ({},{})  {:.0}%  ·  {} visits  ·  {:.1}% policy",
-                                pos.0,
-                                pos.1,
-                                wr * 100.0,
-                                fmt_iters(*visits),
-                                pol * 100.0
-                            ),
+                        let text = format!(
+                            "{marker} ({},{})  {:.0}%  ·  {} visits  ·  {:.1}% policy",
+                            pos.0, pos.1, wr * 100.0, fmt_iters(*visits), pol * 100.0
                         );
+                        let resp = ui.add(
+                            egui::Label::new(RichText::new(text).color(col))
+                                .sense(egui::Sense::hover()),
+                        );
+                        if resp.hovered() {
+                            list_hover_pos = Some(*pos);
+                        }
                     }
                 }
 
@@ -734,6 +741,7 @@ impl eframe::App for App {
             for &(p, _, _, _) in &self.suggestions {
                 cells.insert(p);
             }
+            if let Some(p) = list_hover_pos { cells.insert(p); }
 
             let painter = ui.painter_at(rect);
 
@@ -758,18 +766,18 @@ impl eframe::App for App {
                     .find(|(p, _)| p == pos)
                     .map(|(_, v)| *v)
                     .unwrap_or(0.0);
-                let fill = cell_fill(*pos, &self.game, &win_cells, sug_rank, hovered, policy_prior);
-                let stroke_col = if win_cells.contains(pos) {
+                let fill = cell_fill(*pos, &self.game, &win_cells, sug_rank, hovered, policy_prior, list_hover_pos == Some(*pos));
+                let is_list_hovered = list_hover_pos == Some(*pos);
+                let stroke_col = if is_list_hovered {
+                    Color32::WHITE
+                } else if win_cells.contains(pos) {
                     Color32::YELLOW
                 } else {
                     Color32::from_gray(35)
                 };
+                let stroke_w = if is_list_hovered || win_cells.contains(pos) { 2.5 } else { 1.0 };
 
-                painter.add(egui::Shape::convex_polygon(
-                    corners,
-                    fill,
-                    Stroke::new(if win_cells.contains(pos) { 2.5 } else { 1.0 }, stroke_col),
-                ));
+                painter.add(egui::Shape::convex_polygon(corners, fill, Stroke::new(stroke_w, stroke_col)));
 
                 // Labels.
                 if self.game.board.get(pos).is_some() {

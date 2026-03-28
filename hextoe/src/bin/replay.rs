@@ -442,6 +442,7 @@ impl eframe::App for ReplayApp {
         let mut pan_delta   = egui::Vec2::ZERO;
         let mut zoom_action: Option<(Pos2, f32)> = None;
         let mut scroll_delta = egui::Vec2::ZERO;
+        let mut list_hover_pos: Option<Pos> = None;
 
         // ── Left panel: game list ──────────────────────────────────────────
         egui::SidePanel::left("games")
@@ -528,12 +529,19 @@ impl eframe::App for ReplayApp {
                             let col = if is_actual { step_player.map(player_color).unwrap_or(Color32::GRAY) }
                                 else if rank == 0 { Color32::from_rgb(60, 200, 80) }
                                 else { Color32::GRAY };
-                            ui.colored_label(col, format!(
+                            let text = format!(
                                 "{} #{} ({},{})  {:.1}%  {}",
                                 if is_actual { "●" } else { "○" },
                                 rank + 1, pos.0, pos.1,
                                 score * 100.0, fmt_iters(*visits)
-                            ));
+                            );
+                            let resp = ui.add(
+                                egui::Label::new(RichText::new(text).color(col))
+                                    .sense(egui::Sense::hover()),
+                            );
+                            if resp.hovered() {
+                                list_hover_pos = Some(*pos);
+                            }
                         }
                     }
                 }
