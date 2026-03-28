@@ -211,8 +211,7 @@ fn rollout_pick_action(
 }
 
 impl RolloutPolicy for RandomRollout {
-    /// Same threat-weighted priors as [`NNUERollout`] so interactive play with
-    /// random rollouts also blocks/attacks correctly.
+    /// Compound-threat-aware priors so interactive play blocks/attacks correctly.
     fn priors_only(&self, state: &GameState) -> Option<Vec<(Pos, f32)>> {
         let actions = state.legal_actions();
         if actions.is_empty() {
@@ -220,12 +219,7 @@ impl RolloutPolicy for RandomRollout {
         }
         let me = state.current_player();
         let opp = me.other();
-        let raw: Vec<(Pos, f32)> = actions
-            .iter()
-            .map(|&pos| (pos, move_weight(&state.board, pos, me, opp)))
-            .collect();
-        // Only return priors when there are notable threats — otherwise let UCB1 handle it.
-        // This avoids paying the scan cost on every node when the position is calm.
+        let raw = compound_threat_priors(state, &actions, me, opp);
         let max_w = raw.iter().map(|(_, w)| *w).fold(0.0f32, f32::max);
         if max_w <= 1.0 {
             return None; // all moves equal weight → let UCB1 do its thing

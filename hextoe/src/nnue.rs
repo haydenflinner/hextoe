@@ -32,7 +32,7 @@ use rand::Rng;
 
 use crate::encode::board_center;
 use crate::game::{max_run_through, GameState, Player, Pos};
-use crate::mcts::{move_weight, RolloutPolicy};
+use crate::mcts::RolloutPolicy;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -313,10 +313,9 @@ impl RolloutPolicy for NNUERollout {
         (self.eval_state(&state, root_player), None)
     }
 
-    /// Return threat-weighted priors so PUCT focuses the search budget on the
-    /// most tactically relevant moves first.  Uses the shared [`move_weight`]
-    /// function which detects both linear runs and multi-axis threats (Triangle /
-    /// Rhombus formations from Hex Tac-Toe theory).
+    /// Return compound-threat-aware priors so PUCT focuses the search budget on
+    /// the most tactically relevant moves first.  Uses [`compound_threat_priors`]
+    /// which handles both per-move heuristics and board-level multi-threat detection.
     fn priors_only(&self, state: &GameState) -> Option<Vec<(Pos, f32)>> {
         let actions = state.legal_actions();
         if actions.is_empty() {
@@ -325,11 +324,11 @@ impl RolloutPolicy for NNUERollout {
         let me = state.current_player();
         let opp = me.other();
 
-        let raw: Vec<(Pos, f32)> = actions
-            .iter()
-            .map(|&pos| (pos, move_weight(&state.board, pos, me, opp)))
-            .collect();
-
+        let raw = crate::mcts::compound_threat_priors(state, &actions, me, opp);
+        let max_w = raw.iter().map(|(_, w)| *w).fold(0.0f32, f32::max);
+        if max_w <= 1.0 {
+            return None;
+        }
         let total: f32 = raw.iter().map(|(_, w)| w).sum();
         Some(raw.into_iter().map(|(p, w)| (p, w / total)).collect())
     }
