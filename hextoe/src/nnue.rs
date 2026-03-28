@@ -369,37 +369,43 @@ mod tests {
     }
 
     #[test]
-    fn encode_empty_board_is_empty() {
+    fn encode_empty_board_has_only_turn_features() {
+        // Empty board, X to move (total_moves=0): "X to move" feature is active;
+        // "2nd of pair" is not (total_moves == 0 fails the check).
         let state = GameState::new();
         let feats = encode_nnue(&state, (0, 0));
-        assert!(feats.is_empty());
+        assert_eq!(feats.len(), 1);
+        assert!(feats.contains(&(N_CELLS * 2))); // "X to move"
     }
 
     #[test]
-    fn encode_single_piece_one_feature() {
+    fn encode_single_piece_one_piece_feature() {
         use crate::game::GameState;
         let mut state = GameState::new();
-        state.place((0, 0)); // X anchor
+        state.place((0, 0)); // X anchor, now O to move (total_moves=1, 1st of pair)
         let feats = encode_nnue(&state, (0, 0));
-        assert_eq!(feats.len(), 1);
-        // X piece at (0,0) → cell for (0,0), offset 0.
+        // 1 piece feature (X at origin) + no turn features (O to move, 1st of pair)
+        let piece_feats: Vec<_> = feats.iter().filter(|&&f| f < N_CELLS * 2).collect();
+        assert_eq!(piece_feats.len(), 1);
         let cell_idx = *cell_table().get(&(0, 0)).unwrap();
-        assert_eq!(feats[0], cell_idx);
+        assert!(feats.contains(&cell_idx));
     }
 
     #[test]
     fn encode_x_and_o_use_different_offsets() {
         use crate::game::GameState;
         let mut state = GameState::new();
-        state.place((0, 0)); // X
-        state.place((5, 0)); // O
-        state.place((6, 0)); // O
+        state.place((0, 0)); // X, total_moves=1 → O 1st of pair
+        state.place((5, 0)); // O, total_moves=2 → O 2nd of pair
+        state.place((6, 0)); // O, total_moves=3 → X 1st of pair
         let feats = encode_nnue(&state, (0, 0));
-        // X feature < N_CELLS; O features >= N_CELLS.
+        // Piece features only (filter out turn-indicator range).
         let x_feats: Vec<_> = feats.iter().filter(|&&f| f < N_CELLS).collect();
-        let o_feats: Vec<_> = feats.iter().filter(|&&f| f >= N_CELLS).collect();
+        let o_feats: Vec<_> = feats.iter().filter(|&&f| (N_CELLS..N_CELLS * 2).contains(&f)).collect();
         assert_eq!(x_feats.len(), 1);
         assert_eq!(o_feats.len(), 2);
+        // X is to move → "X to move" feature present
+        assert!(feats.contains(&(N_CELLS * 2)));
     }
 
     #[test]
