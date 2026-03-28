@@ -31,6 +31,10 @@ path = "src/bin/pretrain_nnue.rs"
 name = "hextoe-train-vs-naive"
 path = "src/bin/train_vs_naive.rs"
 
+[[bin]]
+name = "hextoe-train-selfplay"
+path = "src/bin/train_selfplay.rs"
+
 [dependencies]
 rayon = "1.10"
 eframe = "0.28"
