@@ -16,6 +16,91 @@ use crate::nnue::encode_nnue;
 use crate::self_play::GameRecord;
 use crate::symmetry::{apply_transform, transform_state};
 
+// ── Lightweight NNUE-only record ──────────────────────────────────────────────
+
+/// Minimal training record for NNUE-only supervised pre-training.
+/// Unlike [`GameRecord`] this does NOT store the CNN state encoding (~5 KB each),
+/// so loading 9 000 games stays under ~1 GB even with 12× augmentation.
+pub struct NnueRecord {
+    pub feats: Vec<u16>,
+    pub outcome: f32,
+}
+
+/// Load one or more JSON files as [`NnueRecord`]s (no CNN state, no policy target).
+///
+/// Returns `(records, total_used, total_skipped)`.
+pub fn load_nnue_records_multi(
+    paths: &[String],
+) -> Result<(Vec<NnueRecord>, usize, usize), Box<dyn std::error::Error>> {
+    let mut all_records = Vec::new();
+    let mut total_used = 0usize;
+    let mut total_skipped = 0usize;
+    for path in paths {
+        let (records, used, skipped) = load_nnue_records(path)?;
+        println!("  {path}: {used} games used, {skipped} skipped → {} positions", records.len());
+        all_records.extend(records);
+        total_used += used;
+        total_skipped += skipped;
+    }
+    Ok((all_records, total_used, total_skipped))
+}
+
+fn load_nnue_records(
+    path: &str,
+) -> Result<(Vec<NnueRecord>, usize, usize), Box<dyn std::error::Error>> {
+    let content = std::fs::read_to_string(path)?;
+    let file: GamesFile = serde_json::from_str(&content)?;
+    let mut records = Vec::new();
+    let mut used = 0usize;
+    let mut skipped = 0usize;
+    for game in &file.games {
+        match process_game_nnue(game) {
+            Some(recs) => { records.extend(recs); used += 1; }
+            None => skipped += 1,
+        }
+    }
+    Ok((records, used, skipped))
+}
+
+fn process_game_nnue(game: &GameJson) -> Option<Vec<NnueRecord>> {
+    if game.moves.is_empty() { return None; }
+    let reason = game.game_result.reason.as_str();
+    if !matches!(reason, "six-in-a-row" | "surrender") { return None; }
+    let winner_id = game.game_result.winning_player_id.as_deref()?;
+
+    let mut moves: Vec<&MoveJson> = game.moves.iter().collect();
+    moves.sort_by_key(|m| m.move_number);
+
+    let first_player_id = moves[0].player_id.as_str();
+    let winner_player = if winner_id == first_player_id { Player::X } else { Player::O };
+
+    let mut state = GameState::new();
+    let mut steps: Vec<(GameState, Pos, Player)> = Vec::new();
+    for m in &moves {
+        if state.is_terminal() { break; }
+        let pos = (m.x, m.y);
+        let current_player = state.current_player();
+        let snapshot = state.clone();
+        if !state.place(pos) { return None; }
+        steps.push((snapshot, pos, current_player));
+    }
+    if steps.is_empty() { return None; }
+
+    let mut records = Vec::new();
+    for (snap, _pos, player) in &steps {
+        let outcome = if *player == winner_player { 1.0f32 } else { -1.0f32 };
+        for tid in 0u8..12 {
+            let ts = transform_state(snap, tid);
+            let tc = board_center(&ts);
+            let feats: Vec<u16> = encode_nnue(&ts, tc).into_iter().map(|f| f as u16).collect();
+            if !feats.is_empty() {
+                records.push(NnueRecord { feats, outcome });
+            }
+        }
+    }
+    if records.is_empty() { None } else { Some(records) }
+}
+
 // ── JSON schema ───────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]

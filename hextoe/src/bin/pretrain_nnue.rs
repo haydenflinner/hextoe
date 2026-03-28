@@ -1,37 +1,40 @@
 //! Supervised pre-training of the NNUE value network from online game data (JSON).
 //!
 //! Usage:
-//!   hextoe-pretrain-nnue <games1.json> [games2.json ...] [--epochs N] [--batch-size B] [--lr LR] [--out path]
+//!   hextoe-pretrain-nnue <games1.json> [games2.json ...] [--epochs N] [--batch-size B]
+//!                        [--lr LR] [--out path] [--positions-per-epoch N]
 //!
 //! Accepts one or more JSON files (pass a shell glob and the shell will expand it).
 //! Trains only the value head (MSE loss). The NNUE has no policy head.
-//! Typical workflow: run this once on human game data before self-play to give
-//! the value network a warm start, then let the self-play loop keep it updated.
+//!
+//! --positions-per-epoch N
+//!   Each epoch trains on a random subset of N positions instead of the full dataset.
+//!   Useful when the dataset is large: short epochs give frequent progress reports and
+//!   checkpoints while still seeing the full dataset over many epochs.
+//!   Default: use all positions every epoch.
 
 use std::path::Path;
 use std::time::Instant;
 
-use candle_core::Device;
+use candle_core::{Device, Tensor};
 use candle_nn::optim::{AdamW, ParamsAdamW};
 use candle_nn::Optimizer;
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
 
-use hextoe::nnue::{build_nnue_model, DEFAULT_NNUE_PATH};
-use hextoe::self_play::GameRecord;
-use hextoe::supervised::load_supervised_records_multi;
-use hextoe::train::nnue_train_step;
+use hextoe::nnue::{build_nnue_model, NNUENet, DEFAULT_NNUE_PATH};
+use hextoe::supervised::load_nnue_records_multi;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 || args[1].starts_with('-') {
         eprintln!(
-            "Usage: hextoe-pretrain-nnue <games1.json> [games2.json ...] [--epochs N] [--batch-size B] [--lr LR] [--out path]"
+            "Usage: hextoe-pretrain-nnue <games1.json> [games2.json ...] \
+             [--epochs N] [--batch-size B] [--lr LR] [--out path] [--positions-per-epoch N]"
         );
         std::process::exit(1);
     }
 
-    // Collect positional args (everything before the first --flag).
     let json_paths: Vec<String> = args[1..]
         .iter()
         .take_while(|a| !a.starts_with('-'))
@@ -41,30 +44,22 @@ fn main() {
     let batch_size = parse_arg(&args, "--batch-size", 256usize);
     let lr = parse_arg_f64(&args, "--lr", 1e-3);
     let out_path = parse_arg_str(&args, "--out", DEFAULT_NNUE_PATH);
+    let positions_per_epoch = parse_arg(&args, "--positions-per-epoch", 0usize); // 0 = all
 
     println!("Loading game data from {} file(s)…", json_paths.len());
-    let (records, used, skipped) = match load_supervised_records_multi(&json_paths) {
+    let (records, used, skipped) = match load_nnue_records_multi(&json_paths) {
         Ok(x) => x,
-        Err(e) => {
-            eprintln!("Error loading games: {e}");
-            std::process::exit(1);
-        }
+        Err(e) => { eprintln!("Error loading games: {e}"); std::process::exit(1); }
     };
     println!("Total: {} games used, {} skipped → {} positions", used, skipped, records.len());
-
-    // Check NNUE coverage.
-    let nnue_count = records.iter().filter(|r| !r.nnue_feats.is_empty()).count();
-    println!("  {} positions have NNUE features ({:.1}%)", nnue_count, 100.0 * nnue_count as f64 / records.len().max(1) as f64);
-    if nnue_count == 0 {
+    if records.is_empty() {
         eprintln!("No records with NNUE features — nothing to train on.");
         std::process::exit(1);
     }
 
-    // NNUE always trains on CPU.
     let device = Device::Cpu;
     let (mut nnue_varmap, nnue_model) = build_nnue_model(&device).expect("build NNUE model");
 
-    // Load existing weights if present for fine-tuning.
     if Path::new(&out_path).exists() {
         match nnue_varmap.load(&out_path) {
             Ok(()) => println!("Loaded existing NNUE weights from {out_path}"),
@@ -77,10 +72,15 @@ fn main() {
     let adam_params = ParamsAdamW { lr, weight_decay: 1e-4, ..Default::default() };
     let mut opt = AdamW::new(nnue_varmap.all_vars(), adam_params).expect("optimizer");
 
-    let steps_per_epoch = (nnue_count + batch_size - 1) / batch_size;
+    let epoch_size = if positions_per_epoch > 0 {
+        positions_per_epoch.min(records.len())
+    } else {
+        records.len()
+    };
+    let steps_per_epoch = (epoch_size + batch_size - 1) / batch_size;
     println!(
-        "Training NNUE: {} epochs × {} steps/epoch (batch {}), lr={lr:.2e}",
-        epochs, steps_per_epoch, batch_size
+        "Training NNUE: {} epochs × {} steps/epoch (batch {}, {}/{} positions/epoch), lr={lr:.2e}",
+        epochs, steps_per_epoch, batch_size, epoch_size, records.len()
     );
 
     let mut rng = rand::rngs::StdRng::seed_from_u64(42);
@@ -95,15 +95,26 @@ fn main() {
         let mut epoch_loss = 0.0f32;
         let mut epoch_steps = 0usize;
 
-        for chunk in indices.chunks(batch_size) {
-            let batch: Vec<&GameRecord> = chunk.iter().map(|&i| &records[i]).collect();
-            match nnue_train_step(&nnue_model, &batch, &device, &mut opt) {
-                Ok(Some(loss)) => {
-                    epoch_loss += loss;
-                    epoch_steps += 1;
-                }
-                Ok(None) => {}
-                Err(e) => eprintln!("nnue_train_step error: {e}"),
+        for chunk in indices[..epoch_size].chunks(batch_size) {
+            let features_batch: Vec<Vec<usize>> = chunk
+                .iter()
+                .map(|&i| records[i].feats.iter().map(|&f| f as usize).collect())
+                .collect();
+            let z_data: Vec<f32> = chunk.iter().map(|&i| records[i].outcome).collect();
+            let b = features_batch.len();
+
+            let result = (|| -> candle_core::Result<f32> {
+                let input = NNUENet::dense_from_sparse(&features_batch, &device)?;
+                let target = Tensor::from_slice(&z_data, (b, 1usize), &device)?;
+                let output = nnue_model.forward(&input)?;
+                let loss = (&output - &target)?.sqr()?.mean_all()?;
+                opt.backward_step(&loss)?;
+                loss.to_scalar::<f32>()
+            })();
+
+            match result {
+                Ok(loss) => { epoch_loss += loss; epoch_steps += 1; }
+                Err(e) => eprintln!("train step error: {e}"),
             }
         }
 
