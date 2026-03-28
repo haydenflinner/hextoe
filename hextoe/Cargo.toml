@@ -35,6 +35,10 @@ path = "src/bin/train_vs_naive.rs"
 name = "hextoe-train-selfplay"
 path = "src/bin/train_selfplay.rs"
 
+[[bin]]
+name = "hextoe-replay"
+path = "src/bin/replay.rs"
+
 [dependencies]
 ctrlc = "3"
 rayon = "1.10"
