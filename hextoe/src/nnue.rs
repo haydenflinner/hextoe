@@ -182,8 +182,8 @@ impl NNUENet {
 
         // ONE index_select: [b*max_len, L1_SIZE] → [b, max_len, L1_SIZE]
         let rows = w0_t.index_select(&idx, 0)?.reshape((b, max_len, L1_SIZE))?;
-        // Masked sum over the feature dimension → [b, L1_SIZE]
-        let acc  = ((rows * mask)?.sum(1)? + b0.unsqueeze(0)?)?.clamp(0f32, 1f32)?;
+        // Masked sum: broadcast mask [b, max_len, 1] → [b, max_len, L1_SIZE], then sum.
+        let acc  = (rows.broadcast_mul(&mask)?.sum(1)? + b0.unsqueeze(0)?)?.clamp(0f32, 1f32)?;
 
         let l2 = self.fc1.forward(&acc)?.clamp(0f32, 1f32)?;
         let l3 = self.fc2.forward(&l2)?.clamp(0f32, 1f32)?;
