@@ -14,7 +14,7 @@ use rand::Rng;
 
 use crate::encode::{action_to_index, board_center, encode_state, index_to_action, CHANNELS, GRID};
 use crate::game::{GameState, Player, Pos};
-use crate::mcts::{RandomRollout, RolloutPolicy, MAX_GAME_MOVES};
+use crate::mcts::{compound_threat_priors, RandomRollout, RolloutPolicy, MAX_GAME_MOVES};
 
 const HIDDEN: usize = 64;
 const RES_BLOCKS: usize = 4;
@@ -279,16 +279,34 @@ pub fn neural_leaf_value_policy(
 }
 
 /// Extract PUCT priors for `state`'s legal actions from a network forward pass.
+/// Blends NN priors 50/50 with compound_threat_priors when tactical threats exist.
 fn nn_priors(net: &HextoeNet, device: &Device, state: &GameState) -> Option<Vec<(Pos, f32)>> {
     let center = board_center(state);
     let (probs, _) = net.evaluate_state(state, device).ok()?;
     let legal = state.legal_actions();
+    let me = state.current_player();
+    let opp = me.other();
+    let tac_raw = compound_threat_priors(state, &legal, me, opp);
+    let tac_max = tac_raw.iter().map(|(_, w)| *w).fold(0.0f32, f32::max);
+    let tac_map: std::collections::HashMap<Pos, f32> = if tac_max > 1.0 {
+        let total: f32 = tac_raw.iter().map(|(_, w)| w).sum();
+        tac_raw.into_iter().map(|(p, w)| (p, w / total)).collect()
+    } else {
+        std::collections::HashMap::new()
+    };
     Some(
         legal
             .iter()
             .filter_map(|&pos| {
                 let idx = action_to_index(pos, center)?;
-                Some((pos, probs[idx]))
+                let nn_prior = probs[idx];
+                let prior = if tac_map.is_empty() {
+                    nn_prior
+                } else {
+                    let tac_prior = tac_map.get(&pos).copied().unwrap_or(0.0);
+                    0.5 * nn_prior + 0.5 * tac_prior
+                };
+                Some((pos, prior))
             })
             .collect(),
     )
@@ -316,11 +334,28 @@ fn nn_leaf_eval(
             let cp = state.current_player();
             let value = if cp == root_player { v } else { -v };
             let legal = state.legal_actions();
+            let me = state.current_player();
+            let opp = me.other();
+            let tac_raw = compound_threat_priors(state, &legal, me, opp);
+            let tac_max = tac_raw.iter().map(|(_, w)| *w).fold(0.0f32, f32::max);
+            let tac_map: std::collections::HashMap<Pos, f32> = if tac_max > 1.0 {
+                let total: f32 = tac_raw.iter().map(|(_, w)| w).sum();
+                tac_raw.into_iter().map(|(p, w)| (p, w / total)).collect()
+            } else {
+                std::collections::HashMap::new()
+            };
             let priors: Vec<(Pos, f32)> = legal
                 .iter()
                 .filter_map(|&pos| {
                     let idx = action_to_index(pos, center)?;
-                    Some((pos, probs[idx]))
+                    let nn_prior = probs[idx];
+                    let prior = if tac_map.is_empty() {
+                        nn_prior
+                    } else {
+                        let tac_prior = tac_map.get(&pos).copied().unwrap_or(0.0);
+                        0.5 * nn_prior + 0.5 * tac_prior
+                    };
+                    Some((pos, prior))
                 })
                 .collect();
             (value, Some(priors))
