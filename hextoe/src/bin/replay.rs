@@ -360,215 +360,201 @@ impl eframe::App for ReplayApp {
             ctx.request_repaint();
         }
 
-        // Keyboard nav.
-        ctx.input(|i| {
-            if i.key_pressed(egui::Key::ArrowRight) || i.key_pressed(egui::Key::ArrowDown) {
-                // handled after borrow ends
-            }
-        });
+        // Keyboard nav — apply before building UI.
         let fwd = ctx.input(|i| i.key_pressed(egui::Key::ArrowRight) || i.key_pressed(egui::Key::ArrowDown));
-        let bck = ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft) || i.key_pressed(egui::Key::ArrowUp));
+        let bck = ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)  || i.key_pressed(egui::Key::ArrowUp));
         if fwd { self.step_forward(); }
         if bck { self.step_back(); }
 
-        let game = &self.games[self.game_idx];
-        let move_idx = self.move_idx;
-        let total = game.steps.len();
-        let current_step = if move_idx < total { Some(&game.steps[move_idx]) } else { None };
+        // ── Extract all display data as owned values so closures don't hold ──
+        // a reference into self while we also need &mut self for pan/zoom.
+        let move_idx   = self.move_idx;
+        let game_idx   = self.game_idx;
+        let num_games  = self.games.len();
 
-        // Which move was actually played at this position?
-        let actual_pos = current_step.map(|s| s.pos);
-        let best_pos = self.analysis.as_ref()
+        // Game-level data (cloned).
+        let x_name      = self.games[game_idx].player_names[0].clone();
+        let o_name      = self.games[game_idx].player_names[1].clone();
+        let winner_name = self.games[game_idx].winner_name.clone();
+        let result_reason = self.games[game_idx].result_reason.clone();
+        let total       = self.games[game_idx].steps.len();
+
+        // Current step.
+        let step_pos: Option<Pos>    = self.games[game_idx].steps.get(move_idx).map(|s| s.pos);
+        let step_player: Option<Player> = self.games[game_idx].steps.get(move_idx).map(|s| s.player);
+        let step_name: Option<String>   = self.games[game_idx].steps.get(move_idx).map(|s| s.player_name.clone());
+
+        // Analysis snapshot (cheap clone of vecs of small structs).
+        let analysis_snapshot: Option<Analysis> = self.analysis.as_ref().map(|a| Analysis {
+            iters: a.iters,
+            all_moves: a.all_moves.clone(),
+        });
+
+        let best_pos: Option<Pos> = analysis_snapshot.as_ref()
             .and_then(|a| a.all_moves.first().map(|m| m.0));
+
+        // Game-list labels (cloned once).
+        let game_labels: Vec<String> = self.games.iter().enumerate().map(|(i, g)| {
+            format!("#{} {} vs {}", i + 1, g.player_names[0], g.player_names[1])
+        }).collect();
+
+        // Timeline steps (cloned for the bottom panel).
+        let timeline: Vec<(Player, Pos)> = self.games[game_idx].steps.iter()
+            .map(|s| (s.player, s.pos)).collect();
+
+        // Board state and move-number map (cloned).
+        let board_state: GameState = self.games[game_idx].steps
+            .get(move_idx)
+            .map(|s| s.state.clone())
+            .unwrap_or_else(|| {
+                // Past end: reconstruct by replaying all moves.
+                let mut st = GameState::new();
+                for s in &self.games[game_idx].steps { st.place(s.pos); }
+                st
+            });
+
+        // Final board state for win-line.
+        let final_state: GameState = {
+            let mut st = GameState::new();
+            for s in &self.games[game_idx].steps { st.place(s.pos); }
+            st
+        };
+        let last_pos = self.games[game_idx].steps.last().map(|s| s.pos);
+        let win_cells: std::collections::HashSet<Pos> = last_pos
+            .and_then(|lp| final_state.winner.map(|w| winning_line(&final_state.board, lp, w).into_iter().collect()))
+            .unwrap_or_default();
+
+        let mut move_numbers: std::collections::HashMap<Pos, usize> = Default::default();
+        for (i, s) in self.games[game_idx].steps.iter().enumerate() {
+            if i < move_idx { move_numbers.insert(s.pos, i + 1); }
+        }
+
+        // Blunder fill for actual move.
+        let actual_blunder_fill: Option<Color32> = step_pos
+            .and_then(|p| analysis_snapshot.as_ref()?.blunder_pct(p))
+            .map(blunder_color);
+
+        // ── Deferred actions ──────────────────────────────────────────────
+        let mut game_select:  Option<usize> = None;
+        let mut move_select:  Option<usize> = None;
+        let mut nav_fwd = false;
+        let mut nav_bck = false;
+        let mut pan_delta   = egui::Vec2::ZERO;
+        let mut zoom_action: Option<(Pos2, f32)> = None;
+        let mut scroll_delta = egui::Vec2::ZERO;
 
         // ── Left panel: game list ──────────────────────────────────────────
         egui::SidePanel::left("games")
-            .min_width(160.0)
-            .max_width(200.0)
+            .min_width(160.0).max_width(200.0)
             .show(ctx, |ui| {
                 ui.add_space(6.0);
                 ui.label(RichText::new("Games").strong());
                 ui.separator();
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    for (i, g) in self.games.iter().enumerate() {
-                        let label = format!(
-                            "#{} {} vs {}",
-                            i + 1,
-                            g.player_names[0],
-                            g.player_names[1]
-                        );
-                        let selected = i == self.game_idx;
-                        if ui.selectable_label(selected, &label).clicked() {
-                            // deferred to avoid borrow conflict
-                            let _ = i; // captured below
+                    for (i, label) in game_labels.iter().enumerate() {
+                        if ui.selectable_label(i == game_idx, label).clicked() {
+                            game_select = Some(i);
                         }
-                        // Re-do with index capture:
-                        let _ = label;
                     }
-                    // Re-render with proper click handling:
                 });
-                // We can't call self.go_to_game inside the closure above, so we do a second pass.
             });
-        // Work around borrow: collect click target separately.
-        let mut game_click: Option<usize> = None;
-        egui::SidePanel::left("games_click_shadow")
-            .min_width(0.0)
-            .max_width(0.0)
-            .show(ctx, |_ui| {});
-        // Simpler: just re-draw game list items as buttons in a fresh closure scope.
-        // (egui panels with same id are merged, so we use one panel)
-        // Actually the above approach has a bug. Let's do a single panel properly:
-        // The game list was already shown. Button clicks inside show() closures
-        // do work — we just can't call &mut self methods. Use a local var.
-        // We need to restructure. Use immediate mode correctly:
-        // Collect into local then apply.
 
         // ── Right panel: analysis ──────────────────────────────────────────
         egui::SidePanel::right("analysis")
             .exact_width(240.0)
             .show(ctx, |ui| {
                 ui.add_space(8.0);
-
-                // Game header.
-                let g = &self.games[self.game_idx];
-                let x_col = player_color(Player::X);
-                let o_col = player_color(Player::O);
                 ui.horizontal(|ui| {
-                    ui.colored_label(x_col, RichText::new(&g.player_names[0]).strong());
+                    ui.colored_label(player_color(Player::X), RichText::new(&x_name).strong());
                     ui.label(" vs ");
-                    ui.colored_label(o_col, RichText::new(&g.player_names[1]).strong());
+                    ui.colored_label(player_color(Player::O), RichText::new(&o_name).strong());
                 });
-                if let Some(ref w) = g.winner_name {
-                    ui.label(format!("Winner: {} ({})", w, g.result_reason));
+                if let Some(ref w) = winner_name {
+                    ui.label(format!("Winner: {} ({})", w, result_reason));
                 }
-
                 ui.separator();
 
-                // Move navigation.
                 ui.horizontal(|ui| {
-                    if ui.button("◀").clicked() { /* handled below */ }
+                    if ui.button("◀").clicked() { nav_bck = true; }
                     ui.label(format!("Move {}/{}", move_idx + 1, total));
-                    if ui.button("▶").clicked() { /* handled below */ }
+                    if ui.button("▶").clicked() { nav_fwd = true; }
                 });
-                // Navigation handled via keyboard above; button clicks handled here:
-                ui.horizontal(|ui| {
-                    if ui.button("◀ Back").clicked() {
-                        // can't call self.step_back() here, schedule below
-                    }
-                    if ui.button("Forward ▶").clicked() {
-                        // same
-                    }
-                });
-
                 ui.separator();
 
-                // Current move info.
-                if let Some(step) = current_step {
-                    let col = player_color(step.player);
-                    ui.colored_label(col, RichText::new(&step.player_name).strong());
-                    ui.label(format!("Played: ({}, {})", step.pos.0, step.pos.1));
+                if let (Some(name), Some(player), Some(pos)) = (&step_name, step_player, step_pos) {
+                    ui.colored_label(player_color(player), RichText::new(name).strong());
+                    ui.label(format!("Played: ({}, {})", pos.0, pos.1));
                 }
-
                 ui.separator();
 
-                // Analysis.
-                match &self.analysis {
-                    None => {
-                        ui.label("Analysing…");
-                        ui.spinner();
-                    }
+                match &analysis_snapshot {
+                    None => { ui.label("Analysing…"); ui.spinner(); }
                     Some(a) => {
                         ui.label(format!("Iters: {}", fmt_iters(a.iters)));
-
-                        if let Some(apos) = actual_pos {
-                            let blunder = a.blunder_pct(apos);
-                            let rank = a.rank_of(apos);
-
-                            // Blunder badge.
-                            if let Some(bp) = blunder {
-                                let bcol = blunder_color(bp);
-                                let blabel = blunder_label(bp);
+                        if let Some(apos) = step_pos {
+                            if let Some(bp) = a.blunder_pct(apos) {
                                 egui::Frame::none()
-                                    .fill(bcol)
+                                    .fill(blunder_color(bp))
                                     .inner_margin(egui::Margin::symmetric(8.0, 6.0))
                                     .rounding(egui::Rounding::same(6.0))
                                     .show(ui, |ui| {
-                                        ui.label(RichText::new(blabel)
+                                        ui.label(RichText::new(blunder_label(bp))
                                             .strong().color(Color32::WHITE).size(18.0));
-                                        ui.label(RichText::new(
-                                            format!("-{:.1}%", bp * 100.0)
-                                        ).color(Color32::WHITE));
+                                        ui.label(RichText::new(format!("-{:.1}%", bp * 100.0))
+                                            .color(Color32::WHITE));
                                     });
-                                if let Some(r) = rank {
-                                    ui.label(format!("Move ranked #{} by bot", r + 1));
+                                if let Some(r) = a.rank_of(apos) {
+                                    ui.label(format!("Ranked #{} by bot", r + 1));
                                 }
                             } else {
                                 ui.label("(move not yet explored)");
                             }
-
-                            // Best move info.
                             if let Some(bpos) = best_pos {
-                                if Some(bpos) != actual_pos {
-                                    let best_score = a.best_score();
-                                    ui.add_space(4.0);
-                                    ui.colored_label(
-                                        Color32::from_rgb(60, 200, 80),
-                                        format!("Bot prefers: ({}, {})  {:.1}%",
-                                            bpos.0, bpos.1, best_score * 100.0)
-                                    );
+                                ui.add_space(4.0);
+                                if bpos == apos {
+                                    ui.colored_label(Color32::from_rgb(60, 200, 80), "✓ Bot's top choice");
                                 } else {
-                                    ui.colored_label(
-                                        Color32::from_rgb(60, 200, 80),
-                                        "✓ Matches bot's top choice",
-                                    );
+                                    ui.colored_label(Color32::from_rgb(60, 200, 80),
+                                        format!("Bot prefers: ({},{})  {:.1}%",
+                                            bpos.0, bpos.1, a.best_score() * 100.0));
                                 }
                             }
                         }
-
                         ui.add_space(6.0);
                         ui.separator();
                         ui.label(RichText::new("Top moves").strong());
                         for (rank, (pos, score, visits, _)) in a.all_moves.iter().take(5).enumerate() {
-                            let is_actual = Some(*pos) == actual_pos;
-                            let col = if is_actual {
-                                player_color(current_step.map(|s| s.player).unwrap_or(Player::X))
-                            } else if rank == 0 {
-                                Color32::from_rgb(60, 200, 80)
-                            } else {
-                                Color32::GRAY
-                            };
-                            let marker = if is_actual { "●" } else { "○" };
+                            let is_actual = Some(*pos) == step_pos;
+                            let col = if is_actual { step_player.map(player_color).unwrap_or(Color32::GRAY) }
+                                else if rank == 0 { Color32::from_rgb(60, 200, 80) }
+                                else { Color32::GRAY };
                             ui.colored_label(col, format!(
-                                "{} #{} ({},{}) {:.1}% {}",
-                                marker, rank + 1, pos.0, pos.1,
-                                score * 100.0,
-                                fmt_iters(*visits)
+                                "{} #{} ({},{})  {:.1}%  {}",
+                                if is_actual { "●" } else { "○" },
+                                rank + 1, pos.0, pos.1,
+                                score * 100.0, fmt_iters(*visits)
                             ));
                         }
                     }
                 }
-
                 ui.separator();
                 ui.label(RichText::new("Controls").strong());
-                ui.label("← → arrow keys");
-                ui.label("Click move list to jump");
+                ui.label("← → arrow keys or buttons");
+                ui.label("Click timeline to jump");
             });
 
-        // ── Bottom panel: move list timeline ──────────────────────────────
+        // ── Bottom panel: move timeline ────────────────────────────────────
         egui::TopBottomPanel::bottom("moves")
-            .min_height(60.0)
-            .max_height(120.0)
+            .min_height(40.0).max_height(60.0)
             .show(ctx, |ui| {
                 egui::ScrollArea::horizontal().show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        for (i, step) in game.steps.iter().enumerate() {
-                            let col = player_color(step.player);
-                            let selected = i == move_idx;
-                            let label = format!("{}. ({},{})", i + 1, step.pos.0, step.pos.1);
-                            let rt = RichText::new(&label).color(col);
-                            let rt = if selected { rt.strong() } else { rt };
-                            if ui.selectable_label(selected, rt).clicked() {
-                                game_click = Some(i);
+                        for (i, &(player, pos)) in timeline.iter().enumerate() {
+                            let label = format!("{}. ({},{})", i + 1, pos.0, pos.1);
+                            let rt = RichText::new(&label).color(player_color(player));
+                            let rt = if i == move_idx { rt.strong() } else { rt };
+                            if ui.selectable_label(i == move_idx, rt).clicked() {
+                                move_select = Some(i);
                             }
                         }
                     });
@@ -576,156 +562,105 @@ impl eframe::App for ReplayApp {
             });
 
         // ── Central board panel ────────────────────────────────────────────
-        let mut nav_fwd = false;
-        let mut nav_bck = false;
         egui::CentralPanel::default().show(ctx, |ui| {
             let rect = ui.available_rect_before_wrap();
             let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
 
-            if response.dragged() { self.pan_offset += response.drag_delta(); }
+            if response.dragged() { pan_delta = response.drag_delta(); }
             if response.hovered() {
                 let zoom = ctx.input(|i| i.zoom_delta());
                 if zoom != 1.0 {
                     let ptr = ctx.input(|i| i.pointer.hover_pos()).unwrap_or(rect.center());
-                    let old = self.hex_size;
-                    let new = (old * zoom).clamp(8.0, 120.0);
-                    self.pan_offset = (ptr - rect.center()) * (1.0 - new / old) + (new / old) * self.pan_offset;
-                    self.hex_size = new;
+                    zoom_action = Some((ptr, zoom));
                 }
                 let scroll = ctx.input(|i| i.smooth_scroll_delta);
-                if scroll != egui::Vec2::ZERO { self.pan_offset += scroll; }
+                if scroll != egui::Vec2::ZERO { scroll_delta = scroll; }
             }
 
             let hs = self.hex_size;
             let origin = rect.center() + self.pan_offset;
-            let state = self.current_state();
 
-            // Build final state for winning line check.
-            let last_step_pos = game.steps.last().map(|s| {
-                // reconstruct final state to get winner
-                let mut st = s.state.clone();
-                st.place(s.pos);
-                (st, s.pos)
-            });
-            let win_cells: std::collections::HashSet<Pos> = last_step_pos
-                .as_ref()
-                .and_then(|(st, pos)| {
-                    st.winner.map(|w| winning_line(&st.board, *pos, w).into_iter().collect())
-                })
-                .unwrap_or_default();
-
-            let mut cells: std::collections::HashSet<Pos> = state.board.keys().copied().collect();
+            let mut cells: std::collections::HashSet<Pos> = board_state.board.keys().copied().collect();
             if cells.is_empty() {
                 for dq in -3i32..=3 {
                     for dr in (-3i32).max(-dq-3)..=3i32.min(-dq+3) { cells.insert((dq, dr)); }
                 }
             }
-            for &p in &state.candidates { cells.insert(p); }
+            for &p in &board_state.candidates { cells.insert(p); }
             if let Some(p) = best_pos { cells.insert(p); }
-            if let Some(p) = actual_pos { cells.insert(p); }
+            if let Some(p) = step_pos  { cells.insert(p); }
 
             let painter = ui.painter_at(rect);
             let expanded = rect.expand(hs * 3.0);
-
-            // Move number lookup: which move number placed each cell?
-            let mut move_numbers: std::collections::HashMap<Pos, usize> =
-                std::collections::HashMap::new();
-            for (i, step) in game.steps.iter().enumerate() {
-                if i < move_idx {
-                    move_numbers.insert(step.pos, i + 1);
-                }
-            }
 
             for &pos in &cells {
                 let centre = hex_to_pixel(pos.0, pos.1, hs, origin);
                 if !expanded.contains(centre) { continue; }
 
-                let is_best = best_pos == Some(pos);
-                let is_actual = actual_pos == Some(pos);
+                let is_best   = best_pos  == Some(pos);
+                let is_actual = step_pos  == Some(pos);
                 let corners: Vec<Pos2> = hex_corners(centre, hs - 1.5).into();
 
-                let fill = if let Some(&player) = state.board.get(&pos) {
+                let fill = if let Some(&player) = board_state.board.get(&pos) {
                     if win_cells.contains(&pos) {
                         match player {
                             Player::X => Color32::from_rgb(255, 175, 80),
                             Player::O => Color32::from_rgb(110, 195, 255),
                         }
-                    } else {
-                        player_dark(player)
-                    }
-                } else if is_actual && is_best {
-                    Color32::from_rgb(45, 185, 45) // played the best move
-                } else if is_best {
-                    Color32::from_rgb(45, 185, 45) // bot's best
-                } else if is_actual {
-                    // Tint by blunder severity
-                    self.analysis.as_ref()
-                        .and_then(|a| a.blunder_pct(pos))
-                        .map(blunder_color)
-                        .unwrap_or(Color32::from_gray(80))
-                } else {
-                    Color32::from_gray(52)
-                };
+                    } else { player_dark(player) }
+                } else if is_actual && is_best { Color32::from_rgb(45, 185, 45) }
+                  else if is_best  { Color32::from_rgb(45, 185, 45) }
+                  else if is_actual { actual_blunder_fill.unwrap_or(Color32::from_gray(80)) }
+                  else { Color32::from_gray(52) };
 
-                let stroke_w = if is_actual || is_best { 2.5 } else if win_cells.contains(&pos) { 2.5 } else { 1.0 };
+                let stroke_w = if is_actual || is_best || win_cells.contains(&pos) { 2.5 } else { 1.0 };
                 let stroke_col = if is_actual && is_best { Color32::WHITE }
-                    else if is_best { Color32::from_rgb(100, 255, 100) }
+                    else if is_best  { Color32::from_rgb(100, 255, 100) }
                     else if is_actual { Color32::WHITE }
                     else if win_cells.contains(&pos) { Color32::YELLOW }
                     else { Color32::from_gray(35) };
 
-                painter.add(egui::Shape::convex_polygon(
-                    corners, fill, Stroke::new(stroke_w, stroke_col),
-                ));
+                painter.add(egui::Shape::convex_polygon(corners, fill, Stroke::new(stroke_w, stroke_col)));
 
-                // Labels on cells.
-                let font_size = (hs * 0.32).max(8.0).min(16.0);
-                let font = FontId::proportional(font_size);
-
+                let font = FontId::proportional((hs * 0.32).clamp(8.0, 16.0));
                 if let Some(&mn) = move_numbers.get(&pos) {
-                    painter.text(
-                        centre,
-                        Align2::CENTER_CENTER,
-                        mn.to_string(),
-                        font.clone(),
-                        Color32::WHITE,
-                    );
+                    painter.text(centre, Align2::CENTER_CENTER, mn.to_string(), font, Color32::WHITE);
                 } else if is_best && !is_actual {
-                    painter.text(centre, Align2::CENTER_CENTER, "★", font.clone(),
-                        Color32::WHITE);
-                } else if is_actual && !state.board.contains_key(&pos) {
-                    // Actual played move highlighted but not yet on board — show marker.
-                    if let Some(a) = &self.analysis {
-                        if let Some(bp) = a.blunder_pct(pos) {
-                            painter.text(centre, Align2::CENTER_CENTER,
-                                if bp < 0.02 { "✓" } else if bp < 0.05 { "?" } else { "✗" },
-                                font, Color32::WHITE);
-                        }
+                    painter.text(centre, Align2::CENTER_CENTER, "★", font, Color32::WHITE);
+                } else if is_actual {
+                    if let Some(bp) = analysis_snapshot.as_ref().and_then(|a| a.blunder_pct(pos)) {
+                        painter.text(centre, Align2::CENTER_CENTER,
+                            if bp < 0.02 { "✓" } else if bp < 0.05 { "?" } else { "✗" },
+                            font, Color32::WHITE);
                     }
                 }
             }
 
-            // Nav buttons on board.
-            let nav_rect = egui::Rect::from_min_size(
-                rect.min + egui::vec2(8.0, rect.height() / 2.0 - 20.0),
-                egui::vec2(60.0, 40.0),
-            );
-            let nav_rect_r = egui::Rect::from_min_size(
-                rect.max - egui::vec2(68.0, rect.height() / 2.0),
-                egui::vec2(60.0, 40.0),
-            );
-            if ui.put(nav_rect, egui::Button::new(RichText::new("◀").size(22.0))).clicked() {
-                nav_bck = true;
-            }
-            if ui.put(nav_rect_r, egui::Button::new(RichText::new("▶").size(22.0))).clicked() {
-                nav_fwd = true;
-            }
+            // On-board nav buttons.
+            let nav_l = egui::Rect::from_min_size(
+                rect.min + egui::vec2(8.0, rect.height() / 2.0 - 20.0), egui::vec2(60.0, 40.0));
+            let nav_r = egui::Rect::from_min_size(
+                egui::pos2(rect.max.x - 68.0, rect.min.y + rect.height() / 2.0 - 20.0), egui::vec2(60.0, 40.0));
+            if ui.put(nav_l, egui::Button::new(RichText::new("◀").size(22.0))).clicked() { nav_bck = true; }
+            if ui.put(nav_r, egui::Button::new(RichText::new("▶").size(22.0))).clicked() { nav_fwd = true; }
         });
 
-        // Apply deferred navigation.
+        // ── Apply deferred mutations ───────────────────────────────────────
+        self.pan_offset += pan_delta + scroll_delta;
+        if let Some((ptr, zoom)) = zoom_action {
+            // Zoom toward pointer (requires a dummy rect centre; use current pan).
+            let old = self.hex_size;
+            let new = (old * zoom).clamp(8.0, 120.0);
+            let z = new / old;
+            // We don't have the rect centre here, but egui centres the board on screen centre.
+            // Use pointer relative to origin approx.
+            self.pan_offset = ptr.to_vec2() * (1.0 - z) + z * self.pan_offset;
+            self.hex_size = new;
+        }
         if nav_fwd { self.step_forward(); }
         if nav_bck { self.step_back(); }
-        if let Some(i) = game_click { self.go_to_move(i); }
+        if let Some(i) = move_select { self.go_to_move(i); }
+        if let Some(i) = game_select { self.go_to_game(i); }
     }
 }
 
