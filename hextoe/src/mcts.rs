@@ -107,6 +107,66 @@ pub(crate) fn move_weight(
     }
 }
 
+/// Compute PUCT prior weights for `actions` with compound-threat awareness.
+///
+/// First scores every move with [`move_weight`] (single-position analysis), then
+/// does a one-time board scan to count *five-extension-points*: empty cells where
+/// `opp` placing would immediately create a 5-in-a-row (winning the same pair via
+/// 5→6 on the second move).  With the pair-move rule, N such points means:
+///
+///   N == 0-1 → base weights are fine
+///   N == 2   → both pair moves must block; suppress everything else
+///   N >= 3   → can't block all; only immediate wins and own-5-threats matter
+pub(crate) fn compound_threat_priors(
+    state: &GameState,
+    actions: &[Pos],
+    me: Player,
+    opp: Player,
+) -> Vec<(Pos, f32)> {
+    // One-time board scan: positions where opp placing creates a run ≥ 5.
+    let critical: std::collections::HashSet<Pos> = state.candidates.iter()
+        .filter(|&&p| !state.board.contains_key(&p))
+        .filter(|&&p| max_run_through(&state.board, p, opp) >= 5)
+        .cloned()
+        .collect();
+    let n = critical.len();
+
+    actions.iter().map(|&pos| {
+        let base = move_weight(&state.board, pos, me, opp);
+        let w = if n >= 3 {
+            // Can't block all threats with one pair → offense-or-die.
+            if base >= 1000.0 {
+                base  // my immediate win
+            } else if base >= 800.0 {
+                base  // must still block opp's immediate win (op_max >= 6)
+            } else if max_run_through(&state.board, pos, me) >= 5 {
+                600.0 // create own 5-threat: forces opp to defend, races their win
+            } else if critical.contains(&pos) {
+                300.0 // block one critical point (buys time, pair-mate still threatens)
+            } else {
+                1.0
+            }
+        } else if n == 2 {
+            // Both pair moves must block — suppress pure offense.
+            if base >= 1000.0 {
+                base
+            } else if base >= 800.0 {
+                base
+            } else if max_run_through(&state.board, pos, me) >= 5 {
+                // Own 5-threat forces opp to block, potentially nullifying their plan.
+                base.max(500.0)
+            } else if critical.contains(&pos) {
+                base  // keep the 300 from move_weight
+            } else {
+                1.0   // everything else is irrelevant this pair
+            }
+        } else {
+            base  // 0 or 1 critical threat → per-move weights are sufficient
+        };
+        (pos, w)
+    }).collect()
+}
+
 /// Uniform random playouts (used by the GUI and benchmarks).
 pub struct RandomRollout;
 
