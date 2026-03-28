@@ -6,6 +6,7 @@ build-backend = "maturin"
 name = "hextoe-py"
 requires-python = ">=3.9"
 dependencies = ["numpy"]
+version = "1.0"
 
 [tool.maturin]
 features = ["pyo3/extension-module"]

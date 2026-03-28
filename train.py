@@ -23,17 +23,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-try:
-    from safetensors.torch import load_file as st_load, save_file as st_save
-except ImportError:
-    print("ERROR: safetensors not installed.  Run: pip install safetensors")
-    sys.exit(1)
+#try:
+from safetensors.torch import load_file as st_load, save_file as st_save
+#except ImportError:
+    #print("ERROR: safetensors not installed.  Run: pip install safetensors")
+    #sys.exit(1)
 
 try:
     import hextoe_py
 except ImportError:
     print("ERROR: hextoe_py not built.  Run: cd hextoe-py && maturin develop --release")
-    sys.exit(1)
+    raise
 
 GRID = hextoe_py.GRID          # 33
 CHANNELS = hextoe_py.CHANNELS  # 4
