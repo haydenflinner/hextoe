@@ -9,21 +9,12 @@
 //! instead of O(N_FEATURES × L1_SIZE).
 //!
 //! Feature encoding (always from X's perspective):
-//!   For each (cell, axis, player, level):
-//!     feature_idx = cell_idx*(3*2*N_RUN_LEVELS) + axis*(2*N_RUN_LEVELS)
-//!                   + player_offset*N_RUN_LEVELS + level
-//!     Active when: player has a piece at cell AND run through that cell on axis ≥ level+1.
-//!     This is threshold (cumulative) encoding: a run of 4 activates levels 0,1,2,3.
-//!   Feature N_AXIS_FEATURES + 0 = 1 if X is to move
-//!   Feature N_AXIS_FEATURES + 1 = 1 if this is the 2nd move of the current player's pair
+//!   Two binary features per cell within NNUE_RADIUS of the board centroid:
+//!     feature_idx = cell_idx          (X occupies this cell)
+//!     feature_idx = cell_idx + N_CELLS (O occupies this cell)
+//!   Feature N_CELLS*2 + 0 = 1 if X is to move
+//!   Feature N_CELLS*2 + 1 = 1 if this is the 2nd move of the current player's pair
 //!   "relative" = offset from board centroid, within hex-radius NNUE_RADIUS.
-//!
-//! Why threshold encoding over raw piece presence:
-//!   The network receives the strategic information (run lengths) directly instead
-//!   of having to discover it from scattered piece positions.  A run of 5 immediately
-//!   activates "≥1 through ≥5" — the gradient from winning positions propagates back
-//!   through every length level, teaching the network the value of each extra stone
-//!   in a run without any explicit supervision.
 //!
 //! Output is value from X's perspective; negate for O as root_player.
 //!
@@ -40,7 +31,7 @@ use candle_nn::{linear, Linear, Module, VarBuilder, VarMap};
 use rand::Rng;
 
 use crate::encode::board_center;
-use crate::game::{max_run_through, runs_per_axis, GameState, Player, Pos};
+use crate::game::{max_run_through, GameState, Player, Pos};
 use crate::mcts::{move_weight, RolloutPolicy};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -48,14 +39,10 @@ use crate::mcts::{move_weight, RolloutPolicy};
 pub const NNUE_RADIUS: i32 = 14;
 /// Hex cells within radius 14: 1 + 3·14·15 = 631.
 pub const N_CELLS: usize = 1 + 3 * (NNUE_RADIUS as usize) * (NNUE_RADIUS as usize + 1);
-/// Threshold levels per (cell, axis, player): runs ≥1, ≥2, …, ≥6.
-pub const N_RUN_LEVELS: usize = 6;
-/// Total run-length features: N_CELLS × 3 axes × 2 players × 6 levels.
-pub const N_AXIS_FEATURES: usize = N_CELLS * 3 * 2 * N_RUN_LEVELS;
 /// Two turn-indicator features: "X to move" and "2nd of pair".
 pub const N_TURN_FEATURES: usize = 2;
-/// Total input features.
-pub const N_FEATURES: usize = N_AXIS_FEATURES + N_TURN_FEATURES;
+/// Total input features: one bit per (cell, player) + 2 turn bits.
+pub const N_FEATURES: usize = N_CELLS * 2 + N_TURN_FEATURES;
 pub const L1_SIZE: usize = 512;
 pub const L2_SIZE: usize = 64;
 pub const L3_SIZE: usize = 32;
@@ -88,39 +75,25 @@ fn cell_table() -> &'static HashMap<Pos, usize> {
 
 /// Return the active feature indices for `state`, relative to `center`.
 ///
-/// Uses threshold (cumulative) run-length encoding: for each piece at a cell
-/// within NNUE_RADIUS, activates one feature per axis per run-length level ≤ actual run.
-/// A 4-in-a-row activates the ≥1, ≥2, ≥3, ≥4 threshold features on that axis.
+/// One binary feature per (cell, player): index `cell_idx` for X, `cell_idx + N_CELLS` for O.
 /// Pieces outside NNUE_RADIUS of `center` are silently dropped.
 pub fn encode_nnue(state: &GameState, center: Pos) -> Vec<usize> {
     let table = cell_table();
-    let mut features = Vec::with_capacity(state.board.len() * 3 * N_RUN_LEVELS + N_TURN_FEATURES);
-
-    for (&pos, &player) in &state.board {
-        let rel = (pos.0 - center.0, pos.1 - center.1);
-        let Some(&cell_idx) = table.get(&rel) else { continue };
-        let player_off = if player == Player::X { 0 } else { 1 };
-        let runs = runs_per_axis(&state.board, pos, player);
-
-        for (axis, &run) in runs.iter().enumerate() {
-            let levels = (run as usize).min(N_RUN_LEVELS);
-            let base = cell_idx * (3 * 2 * N_RUN_LEVELS)
-                + axis * (2 * N_RUN_LEVELS)
-                + player_off * N_RUN_LEVELS;
-            for level in 0..levels {
-                features.push(base + level);
-            }
+    let mut features = Vec::with_capacity(state.board.len() + N_TURN_FEATURES);
+    for (&(q, r), &player) in &state.board {
+        let rel = (q - center.0, r - center.1);
+        if let Some(&cell_idx) = table.get(&rel) {
+            let offset = if player == Player::X { 0 } else { N_CELLS };
+            features.push(offset + cell_idx);
         }
     }
-
     // Turn indicator features.
     if state.current_player() == Player::X {
-        features.push(N_AXIS_FEATURES);       // "X to move"
+        features.push(N_CELLS * 2);       // "X to move"
     }
     if state.total_moves > 0 && (state.total_moves - 1) % 2 == 1 {
-        features.push(N_AXIS_FEATURES + 1);   // "2nd move of current pair"
+        features.push(N_CELLS * 2 + 1);   // "2nd move of current pair"
     }
-
     features.sort_unstable();
     features
 }
