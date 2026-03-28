@@ -94,6 +94,9 @@ pub struct TrainingConfig {
     pub max_stagnation_rounds: u32,
     /// Number of candidate models per iteration (`1` = classic loop; `>1` = population tournament).
     pub population_size: usize,
+    /// If true, half of self-play games are played against the naive greedy bot instead of
+    /// self-play. Generates decisive games with real threats, useful early in training.
+    pub use_naive_opponent: bool,
 }
 
 impl Default for TrainingConfig {
@@ -127,6 +130,7 @@ impl TrainingConfig {
             min_promotion_games: DEFAULT_MIN_PROMOTION_GAMES,
             max_stagnation_rounds: DEFAULT_MAX_STAGNATION_ROUNDS,
             population_size: DEFAULT_POPULATION_SIZE,
+            use_naive_opponent: false,
         }
     }
 
@@ -141,6 +145,9 @@ impl TrainingConfig {
             cfg.use_random_rollout = false;
         } else if !cli_use_random_rollout() && Path::new(&cfg.nnue_path).exists() {
             cfg.use_nnue_rollout = true;
+        }
+        if std::env::args().skip(1).any(|a| a == "--naive-opponent") {
+            cfg.use_naive_opponent = true;
         }
         cfg
     }
@@ -319,7 +326,12 @@ pub fn self_play_until_duration<P: RolloutPolicy + Send + Sync>(
             game_i += 1;
             let t0 = Instant::now();
             let n_prog = config.self_play_progress_every_n_moves;
-            let records = collector.play_game_with_progress(
+            // Every other game uses the naive opponent when enabled.
+            let use_naive = config.use_naive_opponent && game_i % 2 == 0;
+            let naive_player = if rng.gen::<bool>() { crate::game::Player::X } else { crate::game::Player::O };
+            let records = if use_naive {
+                collector.play_game_vs_naive(config.mcts_iters_per_move, rng, rollout, naive_player)
+            } else { collector.play_game_with_progress(
                 config.mcts_iters_per_move,
                 rng,
                 rollout,
@@ -345,7 +357,7 @@ pub fn self_play_until_duration<P: RolloutPolicy + Send + Sync>(
                         ),
                     );
                 },
-            );
+            ) };
             let secs = t0.elapsed().as_secs_f64();
             game_secs.push(secs);
             let positions = records.len();
