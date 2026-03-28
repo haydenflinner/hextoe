@@ -5,7 +5,7 @@ use candle_core::Device;
 
 use crate::encode::{action_to_index, board_center, encode_state, CHANNELS, GRID};
 use crate::game::{GameState, Player, Pos};
-use crate::mcts::{Mcts, RolloutPolicy, MAX_GAME_MOVES};
+use crate::mcts::{Mcts, NaiveRollout, RolloutPolicy, MAX_GAME_MOVES};
 use crate::nn::{DualNetRollout, HextoeNet};
 use crate::nnue::encode_nnue;
 
@@ -209,6 +209,85 @@ impl SelfPlayCollector {
                     outcome,
                     nnue_feats,
                 }
+            })
+            .collect()
+    }
+
+    /// Play one game where `naive_player` uses a greedy [`NaiveRollout`] (no MCTS — just
+    /// argmax of own-run-extension priors) and the other player uses full MCTS with
+    /// `rollout`. Records are collected for both sides so the trained bot sees the naive
+    /// bot's positions with their outcomes.
+    pub fn play_game_vs_naive<R: Rng, P: RolloutPolicy>(
+        &self,
+        mcts_iters: u32,
+        rng: &mut R,
+        rollout: &P,
+        naive_player: Player,
+    ) -> Vec<GameRecord> {
+        let naive = NaiveRollout;
+        let mut state = GameState::new();
+        let mut steps: Vec<([f32; CHANNELS * GRID * GRID], [f32; GRID * GRID], Player, Vec<u16>)> =
+            Vec::new();
+        let mut move_count = 0u32;
+
+        loop {
+            if state.is_terminal() || move_count >= MAX_GAME_MOVES {
+                break;
+            }
+            let state_enc = encode_state(&state);
+            let center = board_center(&state);
+            let current_player = state.current_player();
+            let nnue_feats: Vec<u16> =
+                encode_nnue(&state, center).into_iter().map(|f| f as u16).collect();
+
+            let chosen_pos = if current_player == naive_player {
+                // Naive player: pick argmax of own-run-extension priors, no MCTS.
+                naive.priors_only(&state)
+                    .and_then(|priors| priors.into_iter().max_by(|a, b| a.1.partial_cmp(&b.1).unwrap()))
+                    .map(|(pos, _)| pos)
+                    .unwrap_or_else(|| state.legal_actions()[0])
+            } else {
+                // Trained player: full MCTS.
+                let mut mcts = Mcts::new(state.clone());
+                mcts.search_iters(mcts_iters, rng, rollout);
+                let stats = mcts.root_children_stats();
+                let total: u32 = stats.iter().map(|(_, v)| v).sum();
+                if total == 0 {
+                    state.legal_actions()[0]
+                } else {
+                    let threshold = rng.gen::<f32>() * total as f32;
+                    let mut cum = 0.0f32;
+                    let mut chosen = stats[0].0;
+                    for &(pos, visits) in &stats {
+                        cum += visits as f32;
+                        if cum >= threshold { chosen = pos; break; }
+                    }
+                    chosen
+                }
+            };
+
+            // Build pi from a one-hot on chosen_pos for the naive player,
+            // or from MCTS visit counts for the trained player (already sampled above).
+            let mut pi = [0.0f32; GRID * GRID];
+            if let Some(idx) = action_to_index(chosen_pos, center) {
+                pi[idx] = 1.0;
+            }
+
+            steps.push((state_enc, pi, current_player, nnue_feats));
+            state.place(chosen_pos);
+            move_count += 1;
+        }
+
+        let winner = state.winner;
+        steps
+            .into_iter()
+            .map(|(state_enc, pi, player, nnue_feats)| {
+                let outcome = match winner {
+                    Some(w) if w == player => 1.0,
+                    Some(_) => -1.0,
+                    None => state.board_heuristic(player),
+                };
+                GameRecord { state_enc: Box::new(state_enc), pi: Box::new(pi), outcome, nnue_feats }
             })
             .collect()
     }

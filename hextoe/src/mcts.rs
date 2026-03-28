@@ -6,7 +6,7 @@
 ///   enumeration never rescans the full board.
 /// - Rewards are stored from a fixed root-player perspective, avoiding
 ///   per-level sign bookkeeping that breaks for 2-moves-per-turn games.
-use crate::game::{runs_per_axis, GameState, Player, Pos};
+use crate::game::{max_run_through, runs_per_axis, GameState, Player, Pos};
 use rand::Rng;
 use rayon::prelude::*;
 
@@ -204,6 +204,57 @@ impl RolloutPolicy for RandomRollout {
     }
 
     const PARALLEL_SAFE: bool = true;
+}
+
+/// Naive greedy opponent: always tries to extend its own longest run, ignores blocking.
+///
+/// Prior weight = 5^(run_length − 1), so extending a run of 3 (weight 25) dominates
+/// a new isolated piece (weight 1). Used as a fixed sparring partner during self-play
+/// to generate decisive games where real threats develop.
+pub struct NaiveRollout;
+
+impl RolloutPolicy for NaiveRollout {
+    fn priors_only(&self, state: &GameState) -> Option<Vec<(Pos, f32)>> {
+        let actions = state.legal_actions();
+        if actions.is_empty() {
+            return None;
+        }
+        let me = state.current_player();
+        let raw: Vec<(Pos, f32)> = actions
+            .iter()
+            .map(|&pos| {
+                let run = max_run_through(&state.board, pos, me);
+                let w = if run >= 6 { 1_000_000.0 } else { 5f32.powi(run as i32 - 1) };
+                (pos, w)
+            })
+            .collect();
+        let total: f32 = raw.iter().map(|(_, w)| w).sum();
+        Some(raw.into_iter().map(|(p, w)| (p, w / total)).collect())
+    }
+
+    fn rollout(&self, mut state: GameState, root_player: Player, rng: &mut impl Rng) -> (f32, Option<Vec<(Pos, f32)>>) {
+        // Simulate greedily: always extend own longest run.
+        let mut ply = 0u32;
+        while !state.is_terminal() {
+            if ply >= MAX_GAME_MOVES {
+                return (state.board_heuristic(root_player), None);
+            }
+            let actions = state.legal_actions();
+            if actions.is_empty() { break; }
+            let me = state.current_player();
+            let best = actions.iter().copied().max_by_key(|&pos| {
+                max_run_through(&state.board, pos, me)
+            }).unwrap_or(actions[0]);
+            state.place(best);
+            ply += 1;
+        }
+        let value = match state.winner {
+            Some(p) if p == root_player => 1.0,
+            Some(_) => -1.0,
+            None => state.board_heuristic(root_player),
+        };
+        (value, None)
+    }
 }
 
 struct Node {
