@@ -39,8 +39,8 @@ pub trait RolloutPolicy {
         None
     }
 
-    /// If true, root-parallel search may use an equivalent stateless rollout
-    /// ([`RandomRollout`] only). Other policies always run serially.
+    /// If true, [`Mcts::search_iters`] may shard work across Rayon workers; each worker runs
+    /// the same rollout type as the caller (which must be [`Send`] + [`Sync`]).
     const PARALLEL_SAFE: bool = false;
 }
 
@@ -305,7 +305,7 @@ impl RolloutPolicy for NaiveRollout {
         Some(raw.into_iter().map(|(p, w)| (p, w / total)).collect())
     }
 
-    fn rollout(&self, mut state: GameState, root_player: Player, rng: &mut impl Rng) -> (f32, Option<Vec<(Pos, f32)>>) {
+    fn rollout(&self, mut state: GameState, root_player: Player, _rng: &mut impl Rng) -> (f32, Option<Vec<(Pos, f32)>>) {
         // Simulate greedily: always extend own longest run.
         let mut ply = 0u32;
         while !state.is_terminal() {
@@ -328,6 +328,70 @@ impl RolloutPolicy for NaiveRollout {
         };
         (value, None)
     }
+}
+
+/// First this many plies of each simulation use [`naive_best_move`] (tactical); the rest
+/// use the same light random + straight-line bias as [`RandomRollout`]. Shorter greedy
+/// prefix keeps rollouts fast while still resolving urgent threats; the random tail reaches
+/// more decisive terminals so backed-up Q values spread instead of clustering on
+/// [`GameState::board_heuristic`].
+pub const TACTICAL_ROLLOUT_GREEDY_PLIES: u32 = 14;
+
+/// Heuristic MCTS: PUCT priors from [`compound_threat_priors`], hybrid rollouts (tactical
+/// prefix + random tail). No NN — replay / analysis when nets are weak or unavailable.
+pub struct TacticalRollout;
+
+impl RolloutPolicy for TacticalRollout {
+    fn priors_only(&self, state: &GameState) -> Option<Vec<(Pos, f32)>> {
+        let actions = state.legal_actions();
+        if actions.is_empty() {
+            return None;
+        }
+        let me = state.current_player();
+        let opp = me.other();
+        let raw = compound_threat_priors(state, &actions, me, opp);
+        let max_w = raw.iter().map(|(_, w)| *w).fold(0.0f32, f32::max);
+        if max_w <= 1.0 {
+            return None;
+        }
+        let total: f32 = raw.iter().map(|(_, w)| w).sum();
+        Some(raw.into_iter().map(|(p, w)| (p, w / total)).collect())
+    }
+
+    fn rollout(&self, mut state: GameState, root_player: Player, rng: &mut impl Rng) -> (f32, Option<Vec<(Pos, f32)>>) {
+        let mut ply = 0u32;
+        let mut x_hist = LastTwoMoves::default();
+        let mut o_hist = LastTwoMoves::default();
+        while !state.is_terminal() {
+            if ply >= MAX_GAME_MOVES {
+                return (state.board_heuristic(root_player), None);
+            }
+            let actions = state.legal_actions();
+            if actions.is_empty() {
+                break;
+            }
+            let action = if ply < TACTICAL_ROLLOUT_GREEDY_PLIES {
+                naive_best_move(&state).unwrap_or_else(|| actions[rng.gen_range(0..actions.len())])
+            } else {
+                rollout_pick_action(&state, &actions, &x_hist, &o_hist, rng)
+            };
+            let who = state.current_player();
+            state.place(action);
+            match who {
+                Player::X => x_hist.record(action),
+                Player::O => o_hist.record(action),
+            }
+            ply += 1;
+        }
+        let value = match state.winner {
+            Some(p) if p == root_player => 1.0,
+            Some(_) => -1.0,
+            None => state.board_heuristic(root_player),
+        };
+        (value, None)
+    }
+
+    const PARALLEL_SAFE: bool = true;
 }
 
 struct Node {
@@ -379,7 +443,16 @@ impl Mcts {
     ///
     /// Parallel workers each run from an empty tree on a clone of the root
     /// [`GameState`], then statistics are merged additively into this tree.
-    pub fn search_iters<P: RolloutPolicy>(&mut self, n: u32, rng: &mut impl Rng, rollout: &P) {
+    ///
+    /// `P` must be [`Send`] + [`Sync`] so the same rollout policy can be shared across Rayon
+    /// workers (e.g. [`RandomRollout`], [`TacticalRollout`]). Policies that opt out via
+    /// [`RolloutPolicy::PARALLEL_SAFE`] still use this type parameter but run serially.
+    pub fn search_iters<P: RolloutPolicy + Send + Sync>(
+        &mut self,
+        n: u32,
+        rng: &mut impl Rng,
+        rollout: &P,
+    ) {
         // Initialise root children_priors for PUCT (no-op when rollout returns None priors).
         if self.nodes[0].children_priors.is_none() {
             if let Some(priors) = rollout.priors_only(&self.nodes[0].state) {
@@ -391,11 +464,10 @@ impl Mcts {
             return;
         }
         // Require ~2 iters per Rayon worker so tree-clone cost pays off.
-        // NN / custom rollouts always run serially (parallel workers use [`RandomRollout`] only).
         if !P::PARALLEL_SAFE || threads == 1 || n < threads as u32 * 2 {
             self.search_iters_serial(n, rng, rollout);
         } else {
-            self.search_iters_parallel(n);
+            self.search_iters_parallel(n, rollout);
         }
     }
 
@@ -418,8 +490,8 @@ impl Mcts {
 
     /// Root-parallel batch: each worker runs from an empty tree on a copy of
     /// the root [`GameState`], then root statistics are merged additively.
-    /// (Workers use [`rand::thread_rng`] and [`RandomRollout`].)
-    fn search_iters_parallel(&mut self, n: u32) {
+    /// Workers share the same `rollout` implementation (must be [`Send`] + [`Sync`]).
+    fn search_iters_parallel<P: RolloutPolicy + Send + Sync>(&mut self, n: u32, rollout: &P) {
         let threads = rayon::current_num_threads().max(1);
         let num_workers = (threads as u32).min(n) as usize;
         let per = n / num_workers as u32;
@@ -436,8 +508,7 @@ impl Mcts {
             .map(|chunk| {
                 let mut m = Mcts::new(root_state.clone());
                 let mut rng = rand::thread_rng();
-                let rollout = RandomRollout;
-                m.search_iters_serial(chunk, &mut rng, &rollout);
+                m.search_iters_serial(chunk, &mut rng, rollout);
                 m
             })
             .collect();
@@ -505,17 +576,15 @@ impl Mcts {
         copy_node(self, other, root_id)
     }
 
-    /// Return the top-`top_n` root children sorted by descending score.
-    /// Each entry is `(pos, score_0_1, visits, policy_share)` where `policy_share`
-    /// is `visits / root_visits` (fraction of simulations that took that edge from root).
+    /// Return the top-`top_n` root children sorted by **descending visit count** (primary
+    /// recommendation signal). Each entry is `(pos, value_display_0_1, visits, policy_share)`
+    /// where `policy_share` is `visits / root_visits`.
     ///
-    /// For **non-terminal** children, `score_0_1` is `(mean_backup + 1) / 2` with
-    /// `mean_backup` the average MCTS backup target in `[-1, 1]` (random rollout
-    /// outcomes and/or neural value at the leaf). That is an **estimate**, not an
-    /// exact win probability unless rollouts are unbiased playouts to terminal.
-    /// For **terminal** children, the score is the exact outcome from [`Node::state`]
-    /// (win / loss / draw for [`Self::root_player`]), ignoring any float noise in
-    /// accumulated `total_value`.
+    /// For **non-terminal** children, `value_display_0_1` is `(mean_backup + 1) / 2` with
+    /// `mean_backup` the average MCTS backup in `[-1, 1]`. That is a **value index**, not a
+    /// calibrated win probability — with heuristic or shallow rollouts it often clusters
+    /// (use visits and this field together). For **terminal** children, the value is the
+    /// exact outcome from [`Node::state`] for [`Self::root_player`].
     pub fn best_moves(&self, top_n: usize) -> Vec<(Pos, f32, u32, f32)> {
         let root_visits = self.nodes[0].visits;
         let root_children = self.nodes[0].children.clone();
@@ -806,7 +875,7 @@ mod tests {
         let q_serial = child_q(&serial, (5, 0));
 
         let mut parallel = Mcts::new(g);
-        parallel.search_iters_parallel(n);
+        parallel.search_iters_parallel(n, &rollout);
         let q_parallel = child_q(&parallel, (5, 0));
 
         assert!(

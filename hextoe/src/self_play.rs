@@ -104,7 +104,7 @@ impl SelfPlayCollector {
     ///
     /// After the game terminates, set each record's `outcome` to +1/-1/0
     /// from the perspective of the player who was to move at that step.
-    pub fn play_game<R: Rng, P: RolloutPolicy>(
+    pub fn play_game<R: Rng, P: RolloutPolicy + Send + Sync>(
         &self,
         mcts_iters: u32,
         rng: &mut R,
@@ -124,7 +124,7 @@ impl SelfPlayCollector {
     ) -> Vec<GameRecord>
     where
         R: Rng,
-        P: RolloutPolicy,
+        P: RolloutPolicy + Send + Sync,
         F: FnMut(u32, Duration),
     {
         let mut state = GameState::new();
@@ -219,7 +219,7 @@ impl SelfPlayCollector {
     /// Play one game where `naive_player` uses a greedy [`NaiveRollout`] (no MCTS — just
     /// argmax of own-run-extension priors) and the other player uses full MCTS with
     /// `rollout`. Returns `(records, winner)` — winner is `None` if the move limit was hit.
-    pub fn play_game_vs_naive<R: Rng, P: RolloutPolicy>(
+    pub fn play_game_vs_naive<R: Rng, P: RolloutPolicy + Send + Sync>(
         &self,
         mcts_iters: u32,
         rng: &mut R,
@@ -297,7 +297,7 @@ impl SelfPlayCollector {
 
     /// Play one eval game: trained rollout vs naive bot. Returns `Some(winner)` or `None`
     /// if the game hit the move limit. The naive player is `naive_player`.
-    pub fn eval_game_vs_naive<R: Rng, P: RolloutPolicy>(
+    pub fn eval_game_vs_naive<R: Rng, P: RolloutPolicy + Send + Sync>(
         &self,
         mcts_iters: u32,
         rng: &mut R,
@@ -422,8 +422,8 @@ impl SelfPlayCollector {
     ) -> (Vec<GameRecord>, Option<Player>)
     where
         R: Rng,
-        P1: RolloutPolicy,
-        P2: RolloutPolicy,
+        P1: RolloutPolicy + Send + Sync,
+        P2: RolloutPolicy + Send + Sync,
     {
         let mut state = GameState::new();
         let mut steps: Vec<([f32; CHANNELS * GRID * GRID], [f32; GRID * GRID], Player, Vec<u16>, Pos)> =
@@ -499,8 +499,8 @@ impl SelfPlayCollector {
     ) -> Option<Player>
     where
         R: Rng,
-        P1: RolloutPolicy,
-        P2: RolloutPolicy,
+        P1: RolloutPolicy + Send + Sync,
+        P2: RolloutPolicy + Send + Sync,
     {
         let mut state = GameState::new();
         let mut move_count = 0u32;

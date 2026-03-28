@@ -1,4 +1,8 @@
-//! hextoe-replay — Game replay analyser with per-move blunder ratings.
+//! hextoe-replay — Game replay analyser with per-move value-gap ratings.
+//!
+//! Search uses heuristic hybrid MCTS (`TacticalRollout` in `hextoe::mcts`): compound-threat
+//! priors, parallel root search, tactical-then-random rollouts. Move ranking follows **visit
+//! counts**; displayed “value” is a backed-up index in 0–1, not calibrated win probability.
 //!
 //! Usage:
 //!   cargo run --release --bin hextoe-replay -- <game-chunk.json> [game_index]
@@ -10,11 +14,8 @@
 
 use eframe::egui;
 use egui::{Align2, Color32, FontId, Pos2, RichText, Stroke};
-use hextoe::device::default_inference_device;
 use hextoe::game::{winning_line, GameState, Player, Pos};
-use hextoe::mcts::{Mcts, RandomRollout};
-use hextoe::nn::{LoadedNet, NeuralRollout};
-use hextoe::train::default_inference_checkpoint_path;
+use hextoe::mcts::{Mcts, TacticalRollout};
 use serde::Deserialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
@@ -152,37 +153,43 @@ struct Analysis {
 }
 
 impl Analysis {
-    fn best_score(&self) -> f32 {
+    /// Mean backed-up value for the visit leader, mapped to [0, 1] (not P(win)).
+    fn visit_leader_value_display(&self) -> f32 {
         self.all_moves.first().map(|m| m.1).unwrap_or(0.5)
     }
 
-    fn score_for(&self, pos: Pos) -> Option<f32> {
+    fn value_display_for(&self, pos: Pos) -> Option<f32> {
         self.all_moves.iter().find(|m| m.0 == pos).map(|m| m.1)
     }
 
-    fn blunder_pct(&self, actual: Pos) -> Option<f32> {
-        let best = self.best_score();
-        let actual_score = self.score_for(actual)?;
-        Some((best - actual_score).max(0.0))
+    /// How far `actual` trails the visit leader on the same 0–1 value index (not % win).
+    fn value_gap_vs_leader(&self, actual: Pos) -> Option<f32> {
+        let best = self.visit_leader_value_display();
+        let actual_v = self.value_display_for(actual)?;
+        Some((best - actual_v).max(0.0))
     }
 
     fn rank_of(&self, pos: Pos) -> Option<usize> {
         self.all_moves.iter().position(|m| m.0 == pos)
     }
+
+    fn visit_leader_share(&self) -> Option<f32> {
+        self.all_moves.first().map(|m| m.3)
+    }
 }
 
-fn blunder_color(pct: f32) -> Color32 {
-    if pct < 0.02 { Color32::from_rgb(70, 200, 90) }       // best / OK
-    else if pct < 0.05 { Color32::from_rgb(220, 210, 50) } // inaccuracy
-    else if pct < 0.15 { Color32::from_rgb(230, 140, 40) } // mistake
-    else { Color32::from_rgb(210, 50, 50) }                 // blunder
+fn value_gap_color(gap: f32) -> Color32 {
+    if gap < 0.02 { Color32::from_rgb(70, 200, 90) }       // matches visit leader
+    else if gap < 0.05 { Color32::from_rgb(220, 210, 50) } // small gap
+    else if gap < 0.15 { Color32::from_rgb(230, 140, 40) } // large gap
+    else { Color32::from_rgb(210, 50, 50) }                 // very large gap
 }
 
-fn blunder_label(pct: f32) -> &'static str {
-    if pct < 0.02 { "Best" }
-    else if pct < 0.05 { "Inaccuracy" }
-    else if pct < 0.15 { "Mistake" }
-    else { "Blunder" }
+fn value_gap_label(gap: f32) -> &'static str {
+    if gap < 0.02 { "Matches leader" }
+    else if gap < 0.05 { "Small gap" }
+    else if gap < 0.15 { "Large gap" }
+    else { "Very large gap" }
 }
 
 // ── Hex geometry (copied from main.rs) ───────────────────────────────────────
@@ -228,7 +235,8 @@ fn player_dark(p: Player) -> Color32 {
 
 // ── App ───────────────────────────────────────────────────────────────────────
 
-const BATCH: u32 = 500;
+/// Iterations per analysis chunk (parallel MCTS makes larger batches affordable).
+const BATCH: u32 = 800;
 
 struct ReplayApp {
     games: Vec<ReplayGame>,
@@ -292,20 +300,13 @@ impl ReplayApp {
         let (tx, rx) = mpsc::channel();
 
         thread::spawn(move || {
-            let device = default_inference_device();
-            let loaded = default_inference_checkpoint_path()
-                .and_then(|p| LoadedNet::try_load(p, &device).ok());
             let mut rng = rand::thread_rng();
             let mut mcts = Mcts::new(state);
+            let rollout = TacticalRollout;
 
             loop {
                 if cancel.load(Ordering::Relaxed) { break; }
-                if let Some(ref ld) = loaded {
-                    let r = NeuralRollout { net: &ld.net, device: &device };
-                    mcts.search_iters(BATCH, &mut rng, &r);
-                } else {
-                    mcts.search_iters(BATCH, &mut rng, &RandomRollout);
-                }
+                mcts.search_iters(BATCH, &mut rng, &rollout);
                 let iters = mcts.total_visits();
                 // Return ALL root children (not just top 3) so we can look up any move.
                 let all_moves = mcts.best_moves(usize::MAX);
@@ -370,7 +371,7 @@ impl eframe::App for ReplayApp {
         // a reference into self while we also need &mut self for pan/zoom.
         let move_idx   = self.move_idx;
         let game_idx   = self.game_idx;
-        let num_games  = self.games.len();
+        let _num_games = self.games.len();
 
         // Game-level data (cloned).
         let x_name      = self.games[game_idx].player_names[0].clone();
@@ -431,8 +432,8 @@ impl eframe::App for ReplayApp {
 
         // Blunder fill for actual move.
         let actual_blunder_fill: Option<Color32> = step_pos
-            .and_then(|p| analysis_snapshot.as_ref()?.blunder_pct(p))
-            .map(blunder_color);
+            .and_then(|p| analysis_snapshot.as_ref()?.value_gap_vs_leader(p))
+            .map(value_gap_color);
 
         // ── Deferred actions ──────────────────────────────────────────────
         let mut game_select:  Option<usize> = None;
@@ -491,21 +492,32 @@ impl eframe::App for ReplayApp {
                 match &analysis_snapshot {
                     None => { ui.label("Analysing…"); ui.spinner(); }
                     Some(a) => {
-                        ui.label(format!("Iters: {}", fmt_iters(a.iters)));
+                        ui.label(format!("MCTS simulations: {}", fmt_iters(a.iters)));
+                        ui.label(
+                            RichText::new(
+                                "Heuristic hybrid · parallel · rank by visits · 0–1 column = mean backup (not P(win))",
+                            )
+                            .small()
+                            .weak(),
+                        );
                         if let Some(apos) = step_pos {
-                            if let Some(bp) = a.blunder_pct(apos) {
+                            if let Some(gap) = a.value_gap_vs_leader(apos) {
                                 egui::Frame::none()
-                                    .fill(blunder_color(bp))
+                                    .fill(value_gap_color(gap))
                                     .inner_margin(egui::Margin::symmetric(8.0, 6.0))
                                     .rounding(egui::Rounding::same(6.0))
                                     .show(ui, |ui| {
-                                        ui.label(RichText::new(blunder_label(bp))
+                                        ui.label(RichText::new(value_gap_label(gap))
                                             .strong().color(Color32::WHITE).size(18.0));
-                                        ui.label(RichText::new(format!("-{:.1}%", bp * 100.0))
+                                        ui.label(RichText::new(format!(
+                                            "Value index gap vs visit leader: {:.2} (not % win chance)",
+                                            gap
+                                        ))
+                                            .small()
                                             .color(Color32::WHITE));
                                     });
                                 if let Some(r) = a.rank_of(apos) {
-                                    ui.label(format!("Ranked #{} by bot", r + 1));
+                                    ui.label(format!("Visit rank: #{} (among explored root moves)", r + 1));
                                 }
                             } else {
                                 ui.label("(move not yet explored)");
@@ -513,27 +525,31 @@ impl eframe::App for ReplayApp {
                             if let Some(bpos) = best_pos {
                                 ui.add_space(4.0);
                                 if bpos == apos {
-                                    ui.colored_label(Color32::from_rgb(60, 200, 80), "✓ Bot's top choice");
+                                    ui.colored_label(Color32::from_rgb(60, 200, 80), "✓ Same as visit leader");
                                 } else {
+                                    let v = a.visit_leader_value_display();
                                     ui.colored_label(Color32::from_rgb(60, 200, 80),
-                                        format!("Bot prefers: ({},{})  {:.1}%",
-                                            bpos.0, bpos.1, a.best_score() * 100.0));
+                                        format!("Visit leader: ({},{})  ·  mean value index ≈ {:.2}",
+                                            bpos.0, bpos.1, v));
+                                    if let Some(sh) = a.visit_leader_share() {
+                                        ui.label(RichText::new(format!("Leader visit share: {:.0}%", sh * 100.0)).small().weak());
+                                    }
                                 }
                             }
                         }
                         ui.add_space(6.0);
                         ui.separator();
-                        ui.label(RichText::new("Top moves").strong());
-                        for (rank, (pos, score, visits, _)) in a.all_moves.iter().take(5).enumerate() {
+                        ui.label(RichText::new("Top moves (by visits)").strong());
+                        for (rank, (pos, score, visits, p_share)) in a.all_moves.iter().take(5).enumerate() {
                             let is_actual = Some(*pos) == step_pos;
                             let col = if is_actual { step_player.map(player_color).unwrap_or(Color32::GRAY) }
                                 else if rank == 0 { Color32::from_rgb(60, 200, 80) }
                                 else { Color32::GRAY };
                             let text = format!(
-                                "{} #{} ({},{})  {:.1}%  {}",
+                                "{} #{} ({},{})  {} visits ({:.0}%)  ·  idx {:.2}",
                                 if is_actual { "●" } else { "○" },
                                 rank + 1, pos.0, pos.1,
-                                score * 100.0, fmt_iters(*visits)
+                                fmt_iters(*visits), p_share * 100.0, score
                             );
                             let resp = ui.add(
                                 egui::Label::new(RichText::new(text).color(col))
@@ -597,6 +613,7 @@ impl eframe::App for ReplayApp {
             for &p in &board_state.candidates { cells.insert(p); }
             if let Some(p) = best_pos { cells.insert(p); }
             if let Some(p) = step_pos  { cells.insert(p); }
+            if let Some(p) = list_hover_pos { cells.insert(p); }
 
             let painter = ui.painter_at(rect);
             let expanded = rect.expand(hs * 3.0);
@@ -607,6 +624,7 @@ impl eframe::App for ReplayApp {
 
                 let is_best   = best_pos  == Some(pos);
                 let is_actual = step_pos  == Some(pos);
+                let is_list_hover = list_hover_pos == Some(pos);
                 let corners: Vec<Pos2> = hex_corners(centre, hs - 1.5).into();
 
                 let fill = if let Some(&player) = board_state.board.get(&pos) {
@@ -621,12 +639,26 @@ impl eframe::App for ReplayApp {
                   else if is_actual { actual_blunder_fill.unwrap_or(Color32::from_gray(80)) }
                   else { Color32::from_gray(52) };
 
-                let stroke_w = if is_actual || is_best || win_cells.contains(&pos) { 2.5 } else { 1.0 };
-                let stroke_col = if is_actual && is_best { Color32::WHITE }
-                    else if is_best  { Color32::from_rgb(100, 255, 100) }
-                    else if is_actual { Color32::WHITE }
-                    else if win_cells.contains(&pos) { Color32::YELLOW }
-                    else { Color32::from_gray(35) };
+                let stroke_w = if is_list_hover {
+                    3.0
+                } else if is_actual || is_best || win_cells.contains(&pos) {
+                    2.5
+                } else {
+                    1.0
+                };
+                let stroke_col = if is_list_hover {
+                    Color32::from_rgb(255, 220, 90)
+                } else if is_actual && is_best {
+                    Color32::WHITE
+                } else if is_best {
+                    Color32::from_rgb(100, 255, 100)
+                } else if is_actual {
+                    Color32::WHITE
+                } else if win_cells.contains(&pos) {
+                    Color32::YELLOW
+                } else {
+                    Color32::from_gray(35)
+                };
 
                 painter.add(egui::Shape::convex_polygon(corners, fill, Stroke::new(stroke_w, stroke_col)));
 
@@ -636,7 +668,7 @@ impl eframe::App for ReplayApp {
                 } else if is_best && !is_actual {
                     painter.text(centre, Align2::CENTER_CENTER, "★", font, Color32::WHITE);
                 } else if is_actual {
-                    if let Some(bp) = analysis_snapshot.as_ref().and_then(|a| a.blunder_pct(pos)) {
+                    if let Some(bp) = analysis_snapshot.as_ref().and_then(|a| a.value_gap_vs_leader(pos)) {
                         painter.text(centre, Align2::CENTER_CENTER,
                             if bp < 0.02 { "✓" } else if bp < 0.05 { "?" } else { "✗" },
                             font, Color32::WHITE);
