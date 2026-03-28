@@ -40,6 +40,11 @@ use hextoe::supervised::load_nnue_records_multi;
 
 const DEFAULT_BEST_PATH: &str = "nnue_best.safetensors";
 
+/// Label smoothing ε applied to human one-hot policy targets.
+const LABEL_SMOOTH_EPS: f32 = 0.1;
+/// Blend weight for heuristic priors when the position has threats (0 = ignore heuristics).
+const HEURISTIC_BLEND_ALPHA: f32 = 0.3;
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -56,7 +61,7 @@ fn main() {
     let buf_cap            = parse_arg(&args, "--buffer",           20_000usize);
     let save_interval      = parse_arg(&args, "--save-interval",    300u64);
     let human_frac_cfg     = parse_arg_f64(&args, "--human-frac",   -1.0); // -1 = auto
-    let policy_weight      = parse_arg_f64(&args, "--policy-weight", 1.0);
+    let policy_weight      = parse_arg_f64(&args, "--policy-weight", 3.0);
     let out_path           = parse_arg_str(&args, "--out",          DEFAULT_NNUE_PATH);
     let best_path          = parse_arg_str(&args, "--best",         DEFAULT_BEST_PATH);
 
@@ -221,14 +226,14 @@ fn main() {
                     z.push(sp_usable[i].outcome);
                 }
 
-                // Human portion — also collect (batch_row, move_idx) for policy supervision.
+                // Human portion — also collect (batch_row, move_idx, record_idx) for policy supervision.
                 let hu_take = hu_per_batch.min(human_records.len());
-                let mut hu_pol_pairs: Vec<(u32, usize)> = Vec::new(); // (batch_row, move_idx)
+                let mut hu_pol_pairs: Vec<(u32, usize, usize)> = Vec::new(); // (batch_row, move_idx, hu_rec_idx)
                 for (j, &i) in hu_idx[..hu_take].iter().enumerate() {
                     feats.push(human_records[i].feats.iter().map(|&f| f as usize).collect());
                     z.push(human_records[i].outcome);
                     if let Some(midx) = human_records[i].move_idx {
-                        hu_pol_pairs.push(((sp_take + j) as u32, midx as usize));
+                        hu_pol_pairs.push(((sp_take + j) as u32, midx as usize, i));
                     }
                 }
 
@@ -251,12 +256,26 @@ fn main() {
                         pol_targets_flat.extend_from_slice(&*sp_usable[si].pi);
                     }
 
-                    // Human rows: one-hot from move_idx
-                    for &(row, midx) in &hu_pol_pairs {
+                    // Human rows: label-smoothed one-hot, blended with heuristic priors if available.
+                    for &(row, midx, hi) in &hu_pol_pairs {
                         pol_row_ids.push(row);
-                        let mut one_hot = vec![0.0f32; GRID * GRID];
-                        one_hot[midx] = 1.0;
-                        pol_targets_flat.extend_from_slice(&one_hot);
+
+                        // Label-smoothed one-hot: (1-ε) on human move, ε/(N-1) elsewhere.
+                        let uniform_eps = LABEL_SMOOTH_EPS / (GRID * GRID - 1) as f32;
+                        let mut target = vec![uniform_eps; GRID * GRID];
+                        target[midx] = 1.0 - LABEL_SMOOTH_EPS;
+
+                        // Heuristic blend: when the position has threats, pull the target
+                        // toward the threat-aware distribution so the model isn't penalised
+                        // for preferring critical blocks over the human's choice.
+                        if !human_records[hi].heuristic_pi.is_empty() {
+                            for v in target.iter_mut() { *v *= 1.0 - HEURISTIC_BLEND_ALPHA; }
+                            for &(hidx, prob) in &human_records[hi].heuristic_pi {
+                                target[hidx as usize] += HEURISTIC_BLEND_ALPHA * prob;
+                            }
+                        }
+
+                        pol_targets_flat.extend_from_slice(&target);
                     }
 
                     let policy_loss_val = if pol_row_ids.is_empty() {

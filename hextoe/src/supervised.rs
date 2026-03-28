@@ -12,6 +12,7 @@ use serde::Deserialize;
 
 use crate::encode::{action_to_index, board_center, encode_state, GRID};
 use crate::game::{GameState, Player, Pos};
+use crate::mcts::compound_threat_priors;
 use crate::nnue::encode_nnue;
 use crate::self_play::GameRecord;
 use crate::symmetry::{apply_transform, transform_state};
@@ -27,6 +28,10 @@ pub struct NnueRecord {
     /// Index into the GRID×GRID policy plane of the move that was played.
     /// `None` if the move fell outside the encoding window.
     pub move_idx: Option<u16>,
+    /// Sparse normalized heuristic policy distribution over GRID×GRID positions.
+    /// Only populated when `compound_threat_priors` returns a non-uniform distribution
+    /// (i.e., there are actual threats on the board). Empty → no heuristic signal.
+    pub heuristic_pi: Vec<(u16, f32)>,
 }
 
 /// Load one or more JSON files as [`NnueRecord`]s (no CNN state, no policy target).
@@ -99,7 +104,31 @@ fn process_game_nnue(game: &GameJson) -> Option<Vec<NnueRecord>> {
             if !feats.is_empty() {
                 let (tq, tr) = apply_transform(tid, pos.0, pos.1);
                 let move_idx = action_to_index((tq, tr), tc).map(|i| i as u16);
-                records.push(NnueRecord { feats, outcome, move_idx });
+
+                // Compute heuristic policy priors when there are actual threats.
+                let heuristic_pi = {
+                    let me = ts.current_player();
+                    let opp = me.other();
+                    let actions = ts.legal_actions();
+                    if actions.is_empty() {
+                        Vec::new()
+                    } else {
+                        let raw = compound_threat_priors(&ts, &actions, me, opp);
+                        let max_w = raw.iter().map(|(_, w)| *w).fold(0.0f32, f32::max);
+                        if max_w > 1.0 {
+                            let total: f32 = raw.iter().map(|(_, w)| w).sum();
+                            raw.into_iter()
+                                .filter_map(|(p, w)| {
+                                    action_to_index(p, tc).map(|i| (i as u16, w / total))
+                                })
+                                .collect()
+                        } else {
+                            Vec::new()
+                        }
+                    }
+                };
+
+                records.push(NnueRecord { feats, outcome, move_idx, heuristic_pi });
             }
         }
     }
