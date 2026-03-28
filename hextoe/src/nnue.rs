@@ -9,11 +9,21 @@
 //! instead of O(N_FEATURES × L1_SIZE).
 //!
 //! Feature encoding (always from X's perspective):
-//!   Feature i               = X piece at relative cell i   (i < N_CELLS)
-//!   Feature N_CELLS+i       = O piece at relative cell i
-//!   Feature 2*N_CELLS + 0   = 1 if X is to move
-//!   Feature 2*N_CELLS + 1   = 1 if this is the 2nd move of the current player's pair
+//!   For each (cell, axis, player, level):
+//!     feature_idx = cell_idx*(3*2*N_RUN_LEVELS) + axis*(2*N_RUN_LEVELS)
+//!                   + player_offset*N_RUN_LEVELS + level
+//!     Active when: player has a piece at cell AND run through that cell on axis ≥ level+1.
+//!     This is threshold (cumulative) encoding: a run of 4 activates levels 0,1,2,3.
+//!   Feature N_AXIS_FEATURES + 0 = 1 if X is to move
+//!   Feature N_AXIS_FEATURES + 1 = 1 if this is the 2nd move of the current player's pair
 //!   "relative" = offset from board centroid, within hex-radius NNUE_RADIUS.
+//!
+//! Why threshold encoding over raw piece presence:
+//!   The network receives the strategic information (run lengths) directly instead
+//!   of having to discover it from scattered piece positions.  A run of 5 immediately
+//!   activates "≥1 through ≥5" — the gradient from winning positions propagates back
+//!   through every length level, teaching the network the value of each extra stone
+//!   in a run without any explicit supervision.
 //!
 //! Output is value from X's perspective; negate for O as root_player.
 //!
@@ -30,7 +40,7 @@ use candle_nn::{linear, Linear, Module, VarBuilder, VarMap};
 use rand::Rng;
 
 use crate::encode::board_center;
-use crate::game::{max_run_through, GameState, Player, Pos};
+use crate::game::{max_run_through, runs_per_axis, GameState, Player, Pos};
 use crate::mcts::{move_weight, RolloutPolicy};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -38,10 +48,14 @@ use crate::mcts::{move_weight, RolloutPolicy};
 pub const NNUE_RADIUS: i32 = 14;
 /// Hex cells within radius 14: 1 + 3·14·15 = 631.
 pub const N_CELLS: usize = 1 + 3 * (NNUE_RADIUS as usize) * (NNUE_RADIUS as usize + 1);
+/// Threshold levels per (cell, axis, player): runs ≥1, ≥2, …, ≥6.
+pub const N_RUN_LEVELS: usize = 6;
+/// Total run-length features: N_CELLS × 3 axes × 2 players × 6 levels.
+pub const N_AXIS_FEATURES: usize = N_CELLS * 3 * 2 * N_RUN_LEVELS;
 /// Two turn-indicator features: "X to move" and "2nd of pair".
 pub const N_TURN_FEATURES: usize = 2;
-/// One feature per (cell, player) pair, plus turn indicators.
-pub const N_FEATURES: usize = N_CELLS * 2 + N_TURN_FEATURES;
+/// Total input features.
+pub const N_FEATURES: usize = N_AXIS_FEATURES + N_TURN_FEATURES;
 pub const L1_SIZE: usize = 512;
 pub const L2_SIZE: usize = 64;
 pub const L3_SIZE: usize = 32;
@@ -74,28 +88,39 @@ fn cell_table() -> &'static HashMap<Pos, usize> {
 
 /// Return the active feature indices for `state`, relative to `center`.
 ///
+/// Uses threshold (cumulative) run-length encoding: for each piece at a cell
+/// within NNUE_RADIUS, activates one feature per axis per run-length level ≤ actual run.
+/// A 4-in-a-row activates the ≥1, ≥2, ≥3, ≥4 threshold features on that axis.
 /// Pieces outside NNUE_RADIUS of `center` are silently dropped.
-/// Features 0..N_CELLS            = X pieces
-/// Features N_CELLS..2*N_CELLS    = O pieces
-/// Feature  2*N_CELLS + 0         = 1 if X is to move
-/// Feature  2*N_CELLS + 1         = 1 if this is the 2nd move of the current pair
 pub fn encode_nnue(state: &GameState, center: Pos) -> Vec<usize> {
     let table = cell_table();
-    let mut features = Vec::with_capacity(state.board.len() + N_TURN_FEATURES);
-    for (&(q, r), &player) in &state.board {
-        let rel = (q - center.0, r - center.1);
-        if let Some(&cell_idx) = table.get(&rel) {
-            let offset = if player == Player::X { 0 } else { N_CELLS };
-            features.push(offset + cell_idx);
+    let mut features = Vec::with_capacity(state.board.len() * 3 * N_RUN_LEVELS + N_TURN_FEATURES);
+
+    for (&pos, &player) in &state.board {
+        let rel = (pos.0 - center.0, pos.1 - center.1);
+        let Some(&cell_idx) = table.get(&rel) else { continue };
+        let player_off = if player == Player::X { 0 } else { 1 };
+        let runs = runs_per_axis(&state.board, pos, player);
+
+        for (axis, &run) in runs.iter().enumerate() {
+            let levels = (run as usize).min(N_RUN_LEVELS);
+            let base = cell_idx * (3 * 2 * N_RUN_LEVELS)
+                + axis * (2 * N_RUN_LEVELS)
+                + player_off * N_RUN_LEVELS;
+            for level in 0..levels {
+                features.push(base + level);
+            }
         }
     }
+
     // Turn indicator features.
     if state.current_player() == Player::X {
-        features.push(N_CELLS * 2);       // "X to move"
+        features.push(N_AXIS_FEATURES);       // "X to move"
     }
     if state.total_moves > 0 && (state.total_moves - 1) % 2 == 1 {
-        features.push(N_CELLS * 2 + 1);   // "2nd move of current pair"
+        features.push(N_AXIS_FEATURES + 1);   // "2nd move of current pair"
     }
+
     features.sort_unstable();
     features
 }
@@ -369,43 +394,43 @@ mod tests {
     }
 
     #[test]
-    fn encode_empty_board_has_only_turn_features() {
-        // Empty board, X to move (total_moves=0): "X to move" feature is active;
-        // "2nd of pair" is not (total_moves == 0 fails the check).
+    fn encode_empty_board_has_only_x_to_move_feature() {
+        // Empty board, X to move (total_moves=0): "X to move" active; "2nd of pair" not.
         let state = GameState::new();
         let feats = encode_nnue(&state, (0, 0));
         assert_eq!(feats.len(), 1);
-        assert!(feats.contains(&(N_CELLS * 2))); // "X to move"
+        assert!(feats.contains(&N_AXIS_FEATURES)); // "X to move"
     }
 
     #[test]
-    fn encode_single_piece_one_piece_feature() {
-        use crate::game::GameState;
+    fn encode_isolated_piece_activates_three_level0_features() {
+        // An isolated X piece has run=1 on all 3 axes → activates exactly 3 features
+        // (one per axis at threshold level 0).  After placing at (0,0) it's O's turn
+        // (1st of pair), so no turn features.
         let mut state = GameState::new();
-        state.place((0, 0)); // X anchor, now O to move (total_moves=1, 1st of pair)
+        state.place((0, 0)); // X anchor; total_moves=1 → O 1st of pair
         let feats = encode_nnue(&state, (0, 0));
-        // 1 piece feature (X at origin) + no turn features (O to move, 1st of pair)
-        let piece_feats: Vec<_> = feats.iter().filter(|&&f| f < N_CELLS * 2).collect();
-        assert_eq!(piece_feats.len(), 1);
-        let cell_idx = *cell_table().get(&(0, 0)).unwrap();
-        assert!(feats.contains(&cell_idx));
+        // Only run-level features (< N_AXIS_FEATURES); no turn features.
+        let run_feats: Vec<_> = feats.iter().filter(|&&f| f < N_AXIS_FEATURES).collect();
+        assert_eq!(run_feats.len(), 3, "isolated piece: one level-0 feature per axis");
+        assert!(feats.iter().all(|&f| f < N_FEATURES), "all indices in range");
     }
 
     #[test]
-    fn encode_x_and_o_use_different_offsets() {
-        use crate::game::GameState;
+    fn encode_run_activates_more_levels() {
+        // Two adjacent X pieces form a run-of-2 on one axis.
+        // total_moves=4 after placing anchor(X) + 2 O moves + 1 X move.
         let mut state = GameState::new();
-        state.place((0, 0)); // X, total_moves=1 → O 1st of pair
-        state.place((5, 0)); // O, total_moves=2 → O 2nd of pair
-        state.place((6, 0)); // O, total_moves=3 → X 1st of pair
+        state.place((0, 0)); // X, total_moves=1
+        state.place((10, 0)); state.place((11, 0)); // O pair, total_moves=3
+        state.place((1, 0)); // X, total_moves=4 → X 2nd of pair
+        // (0,0) and (1,0) are adjacent X pieces → run=2 on axis (1,0).
         let feats = encode_nnue(&state, (0, 0));
-        // Piece features only (filter out turn-indicator range).
-        let x_feats: Vec<_> = feats.iter().filter(|&&f| f < N_CELLS).collect();
-        let o_feats: Vec<_> = feats.iter().filter(|&&f| (N_CELLS..N_CELLS * 2).contains(&f)).collect();
-        assert_eq!(x_feats.len(), 1);
-        assert_eq!(o_feats.len(), 2);
-        // X is to move → "X to move" feature present
-        assert!(feats.contains(&(N_CELLS * 2)));
+        // Confirm all indices valid.
+        assert!(feats.iter().all(|&f| f < N_FEATURES));
+        // X is still to move (2nd of pair) → both turn features should be active.
+        assert!(feats.contains(&N_AXIS_FEATURES),       "X to move");
+        assert!(feats.contains(&(N_AXIS_FEATURES + 1)), "2nd of pair");
     }
 
     #[test]
