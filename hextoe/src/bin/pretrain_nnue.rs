@@ -87,6 +87,7 @@ fn main() {
     let mut indices: Vec<usize> = (0..records.len()).collect();
     let t0 = Instant::now();
     let mut best_loss = f32::MAX;
+    let mut last_save = Instant::now();
 
     for epoch in 1..=epochs {
         let epoch_t0 = Instant::now();
@@ -120,12 +121,20 @@ fn main() {
         } else {
             (eta_secs, "s")
         };
+        let should_save = improved || last_save.elapsed().as_secs() >= 60;
+        let save_marker = if should_save { "  [saved]" } else { "" };
         let marker = if improved { " ↓" } else { "  " };
         println!(
             "epoch {:4}/{epochs}  loss {mean_loss:.5}{marker}  best {best_loss:.5}  \
-             {secs_per_epoch:.1}s/ep  ETA {eta_val:.1}{eta_unit}  (total {elapsed:.0}s)",
+             {secs_per_epoch:.1}s/ep  ETA {eta_val:.1}{eta_unit}  (total {elapsed:.0}s){save_marker}",
             epoch,
         );
+        if should_save {
+            if let Err(e) = nnue_varmap.save(&out_path) {
+                eprintln!("Failed to save: {e}");
+            }
+            last_save = Instant::now();
+        }
     }
 
     match nnue_varmap.save(&out_path) {
