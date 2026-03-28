@@ -1,0 +1,234 @@
+{
+  "games": [
+    {
+      "gameResult": {
+        "winningPlayerId": "tmyxa4",
+        "reason": "six-in-a-row"
+      },
+      "moves": [
+        {
+          "moveNumber": 0,
+          "playerId": "tmyxa4",
+          "x": 0,
+          "y": 0
+        },
+        {
+          "moveNumber": 1,
+          "playerId": "xsi7rj",
+          "x": 1,
+          "y": -1
+        },
+        {
+          "moveNumber": 2,
+          "playerId": "xsi7rj",
+          "x": 3,
+          "y": -3
+        },
+        {
+          "moveNumber": 3,
+          "playerId": "tmyxa4",
+          "x": -1,
+          "y": 0
+        },
+        {
+          "moveNumber": 4,
+          "playerId": "tmyxa4",
+          "x": 0,
+          "y": -1
+        },
+        {
+          "moveNumber": 5,
+          "playerId": "xsi7rj",
+          "x": 4,
+          "y": -4
+        },
+        {
+          "moveNumber": 6,
+          "playerId": "xsi7rj",
+          "x": 5,
+          "y": -5
+        },
+        {
+          "moveNumber": 7,
+          "playerId": "tmyxa4",
+          "x": 6,
+          "y": -6
+        },
+        {
+          "moveNumber": 8,
+          "playerId": "tmyxa4",
+          "x": 0,
+          "y": -6
+        },
+        {
+          "moveNumber": 9,
+          "playerId": "xsi7rj",
+          "x": 3,
+          "y": -1
+        },
+        {
+          "moveNumber": 10,
+          "playerId": "xsi7rj",
+          "x": 5,
+          "y": -1
+        },
+        {
+          "moveNumber": 11,
+          "playerId": "tmyxa4",
+          "x": -1,
+          "y": -1
+        },
+        {
+          "moveNumber": 12,
+          "playerId": "tmyxa4",
+          "x": -1,
+          "y": 1
+        },
+        {
+          "moveNumber": 13,
+          "playerId": "xsi7rj",
+          "x": 4,
+          "y": -1
+        },
+        {
+          "moveNumber": 14,
+          "playerId": "xsi7rj",
+          "x": 3,
+          "y": -5
+        },
+        {
+          "moveNumber": 15,
+          "playerId": "tmyxa4",
+          "x": 6,
+          "y": -1
+        },
+        {
+          "moveNumber": 16,
+          "playerId": "tmyxa4",
+          "x": -1,
+          "y": -2
+        },
+        {
+          "moveNumber": 17,
+          "playerId": "xsi7rj",
+          "x": -1,
+          "y": -3
+        },
+        {
+          "moveNumber": 18,
+          "playerId": "xsi7rj",
+          "x": -1,
+          "y": 2
+        },
+        {
+          "moveNumber": 19,
+          "playerId": "tmyxa4",
+          "x": 1,
+          "y": -2
+        },
+        {
+          "moveNumber": 20,
+          "playerId": "tmyxa4",
+          "x": -2,
+          "y": 1
+        },
+        {
+          "moveNumber": 21,
+          "playerId": "xsi7rj",
+          "x": 2,
+          "y": -3
+        },
+        {
+          "moveNumber": 22,
+          "playerId": "xsi7rj",
+          "x": -3,
+          "y": 2
+        },
+        {
+          "moveNumber": 23,
+          "playerId": "tmyxa4",
+          "x": -2,
+          "y": 0
+        },
+        {
+          "moveNumber": 24,
+          "playerId": "tmyxa4",
+          "x": -3,
+          "y": 0
+        },
+        {
+          "moveNumber": 25,
+          "playerId": "xsi7rj",
+          "x": 1,
+          "y": 0
+        },
+        {
+          "moveNumber": 26,
+          "playerId": "xsi7rj",
+          "x": -4,
+          "y": 0
+        },
+        {
+          "moveNumber": 27,
+          "playerId": "tmyxa4",
+          "x": 0,
+          "y": -3
+        },
+        {
+          "moveNumber": 28,
+          "playerId": "tmyxa4",
+          "x": -2,
+          "y": -1
+        },
+        {
+          "moveNumber": 29,
+          "playerId": "xsi7rj",
+          "x": 1,
+          "y": -4
+        },
+        {
+          "moveNumber": 30,
+          "playerId": "xsi7rj",
+          "x": -4,
+          "y": 1
+        },
+        {
+          "moveNumber": 31,
+          "playerId": "tmyxa4",
+          "x": 0,
+          "y": -2
+        },
+        {
+          "moveNumber": 32,
+          "playerId": "tmyxa4",
+          "x": -2,
+          "y": 2
+        },
+        {
+          "moveNumber": 33,
+          "playerId": "xsi7rj",
+          "x": -2,
+          "y": 3
+        },
+        {
+          "moveNumber": 34,
+          "playerId": "xsi7rj",
+          "x": 0,
+          "y": 1
+        },
+        {
+          "moveNumber": 35,
+          "playerId": "tmyxa4",
+          "x": 0,
+          "y": -4
+        },
+        {
+          "moveNumber": 36,
+          "playerId": "tmyxa4",
+          "x": 0,
+          "y": -5
+        }
+      ]
+    }
+  ]
+}
