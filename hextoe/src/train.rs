@@ -131,13 +131,16 @@ impl TrainingConfig {
     }
 
     /// Same as [`TrainingConfig::default`], but applies CLI overrides (`--random-rollout`,
-    /// `--population N`).
+    /// `--population N`). Auto-enables NNUE rollout if the NNUE checkpoint exists and
+    /// neither `--nnue` nor `--random-rollout` was explicitly passed.
     pub fn default_with_cli_rollout() -> Self {
         let mut cfg = Self::from_defaults(cli_use_random_rollout());
         cfg.population_size = cli_population_size();
         if cli_use_nnue_rollout() {
             cfg.use_nnue_rollout = true;
             cfg.use_random_rollout = false;
+        } else if !cli_use_random_rollout() && Path::new(&cfg.nnue_path).exists() {
+            cfg.use_nnue_rollout = true;
         }
         cfg
     }

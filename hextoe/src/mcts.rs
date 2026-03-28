@@ -52,11 +52,22 @@ pub trait RolloutPolicy {
 ///    20 — extends my run to 5
 ///    15 — blocks opponent's 5-in-a-row
 ///    12 — creates threats on 2+ axes (Triangle / Rhombus multi-axis attack)
-///    10 — blocks opponent's 2+-axis threat
-///     5 — extends my run to 4
-///     4 — blocks opponent's 4-in-a-row
-///     3 — creates a 3-in-a-row on any axis
-///   2.5 — blocks opponent's 3-in-a-row
+/// Tactical prior weight for placing at `pos`.
+///
+/// Weights are intentionally lopsided toward defense: with the pair-move rule an
+/// opponent 4-in-a-row is a near-certain win next turn (extend to 5, then 6 with
+/// the second move of the pair), so blocking must dominate exploration.
+///
+///  1000 — win immediately
+///   800 — block immediate loss (opp completes 6)
+///   300 — block opp 5-in-a-row (they win with next move of pair)
+///    60 — block opp 4-in-a-row (they go 4→5→6 next pair)
+///    50 — create my own 5-in-a-row
+///    30 — create multi-axis fork (Triangle/Rhombus)
+///    25 — block opp multi-axis fork
+///    10 — extend my run to 4
+///     5 — create 3-in-a-row on any axis
+///     4 — block opp 3-in-a-row
 ///     1 — normal move
 pub(crate) fn move_weight(
     board: &std::collections::HashMap<crate::game::Pos, crate::game::Player>,
@@ -72,25 +83,25 @@ pub(crate) fn move_weight(
     let op_axes3 = op_runs.iter().filter(|&&r| r >= 3).count();
 
     if my_max >= 6 {
-        100.0
+        1000.0
     } else if op_max >= 6 {
-        80.0
-    } else if my_max >= 5 {
-        20.0
+        800.0
     } else if op_max >= 5 {
-        15.0
-    } else if my_axes3 >= 2 {
-        12.0
-    } else if op_axes3 >= 2 {
-        10.0
-    } else if my_max >= 4 {
-        5.0
+        300.0  // must block — opp wins with 2nd move of pair
+    } else if my_max >= 5 {
+        50.0
     } else if op_max >= 4 {
-        4.0
+        60.0   // must block — opp goes 4→5→6 next pair
+    } else if my_axes3 >= 2 {
+        30.0
+    } else if op_axes3 >= 2 {
+        25.0
+    } else if my_max >= 4 {
+        10.0
     } else if my_axes3 >= 1 {
-        3.0
+        5.0
     } else if op_axes3 >= 1 {
-        2.5
+        4.0
     } else {
         1.0
     }
