@@ -166,6 +166,131 @@ struct GamesFile {
     games: Vec<GameJson>,
 }
 
+// ── RAM-efficient raw game loading ───────────────────────────────────────────
+
+/// A game stored as a compact move sequence — no CNN encodings, no pre-augmentation.
+/// Use with [`build_sample_index`] + [`encode_sample`] to encode on demand per batch.
+pub struct RawGame {
+    /// Full move sequence (coordinate pairs in play order).
+    pub moves: Vec<Pos>,
+    /// True if the first player (X) won.
+    pub winner_is_first: bool,
+}
+
+/// Load games from one or more JSON files as lightweight [`RawGame`]s.
+///
+/// Returns `(games, total_used, total_skipped)`. Memory cost is roughly
+/// `num_games × avg_moves × 8 bytes` — a few MB even for tens of thousands of games.
+pub fn load_raw_games_multi(
+    paths: &[String],
+) -> Result<(Vec<RawGame>, usize, usize), Box<dyn std::error::Error>> {
+    let mut all = Vec::new();
+    let mut total_used = 0usize;
+    let mut total_skipped = 0usize;
+    for path in paths {
+        let content = std::fs::read_to_string(path)?;
+        let file: GamesFile = serde_json::from_str(&content)?;
+        let (mut used, mut skipped) = (0, 0);
+        for game in &file.games {
+            match parse_raw_game(game) {
+                Some(g) => { all.push(g); used += 1; }
+                None => skipped += 1,
+            }
+        }
+        println!("  {path}: {used} games used, {skipped} skipped");
+        total_used += used;
+        total_skipped += skipped;
+    }
+    Ok((all, total_used, total_skipped))
+}
+
+fn parse_raw_game(game: &GameJson) -> Option<RawGame> {
+    if game.moves.is_empty() { return None; }
+    let reason = game.game_result.reason.as_str();
+    if !matches!(reason, "six-in-a-row" | "surrender") { return None; }
+    let winner_id = game.game_result.winning_player_id.as_deref()?;
+
+    let mut moves: Vec<&MoveJson> = game.moves.iter().collect();
+    moves.sort_by_key(|m| m.move_number);
+
+    let first_player_id = moves[0].player_id.as_str();
+    let winner_is_first = winner_id == first_player_id;
+
+    // Validate the game is playable.
+    let mut state = GameState::new();
+    for m in &moves {
+        if state.is_terminal() { break; }
+        if !state.place((m.x, m.y)) { return None; }
+    }
+
+    Some(RawGame {
+        moves: moves.iter().map(|m| (m.x, m.y)).collect(),
+        winner_is_first,
+    })
+}
+
+/// Pre-compute all valid `(game_idx, step_idx)` pairs by replaying each game
+/// once and checking that the played move falls inside the encoding window.
+///
+/// This index is tiny (~8 bytes per pair) and is shuffled for training.
+pub fn build_sample_index(games: &[RawGame]) -> Vec<(usize, usize)> {
+    let mut index = Vec::new();
+    for (gi, game) in games.iter().enumerate() {
+        let mut state = GameState::new();
+        for (si, &pos) in game.moves.iter().enumerate() {
+            if state.is_terminal() { break; }
+            let center = board_center(&state);
+            if action_to_index(pos, center).is_some() {
+                index.push((gi, si));
+            }
+            state.place(pos);
+        }
+    }
+    index
+}
+
+/// Encode a single `(game_idx, step_idx)` sample into a [`GameRecord`].
+///
+/// Replays the game to `step_idx`, applies symmetry transform `tid` (0–11),
+/// then encodes. Returns `None` if the played move falls outside the grid after
+/// the transform (rare edge case).
+pub fn encode_sample(
+    games: &[RawGame],
+    game_idx: usize,
+    step_idx: usize,
+    tid: u8,
+) -> Option<crate::self_play::GameRecord> {
+    let game = &games[game_idx];
+    let winner_player = if game.winner_is_first { Player::X } else { Player::O };
+
+    // Replay to step_idx.
+    let mut state = GameState::new();
+    for &pos in &game.moves[..step_idx] {
+        state.place(pos);
+    }
+    let player = state.current_player();
+    let pos = game.moves[step_idx];
+    let outcome = if player == winner_player { 1.0f32 } else { -1.0f32 };
+
+    // Apply symmetry transform.
+    let ts = transform_state(&state, tid);
+    let tc = board_center(&ts);
+    let tp = apply_transform(tid, pos.0, pos.1);
+    let idx = action_to_index(tp, tc)?;
+
+    let mut pi = [0.0f32; GRID * GRID];
+    pi[idx] = 1.0;
+    let state_enc = encode_state(&ts);
+
+    Some(crate::self_play::GameRecord {
+        state_enc: Box::new(state_enc),
+        pi: Box::new(pi),
+        outcome,
+        nnue_feats: vec![],
+        center: tc,
+    })
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Load one or more JSON files and merge into a single record list.
