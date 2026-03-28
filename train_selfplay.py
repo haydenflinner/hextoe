@@ -265,7 +265,11 @@ def mcts_search(model, root_state, n_sims, device, c_puct=2.0, temperature=1.0, 
         s = pi.sum()
         pi[:] = 1.0 / G2 if s == 0 else pi / s
 
-    return pi
+    # Root Q is a much better value target than sparse game outcome: it averages
+    # over n_sims explored paths with the current network, giving a per-position
+    # estimate that already accounts for the opponent's best responses.
+    root_q = root.q()
+    return pi, root_q
 
 
 def _expand(node, model, device):
@@ -337,10 +341,10 @@ def play_game_self(model, n_sims, device, temp_moves=10, max_moves=120, eval_bat
     move_num = 0
     while not state.is_terminal() and move_num < max_moves:
         temp = 1.0 if move_num < temp_moves else 0.05
-        pi = mcts_search(model, state, n_sims, device, temperature=temp, eval_batch=eval_batch)
+        pi, mcts_q = mcts_search(model, state, n_sims, device, temperature=temp, eval_batch=eval_batch)
         enc = state.encode()
         player = state.current_player()
-        records.append((enc, pi, player))
+        records.append((enc, pi, player, mcts_q))
 
         action = pick_action_from_pi(state, pi)
         state.place(action[0], action[1])
@@ -348,14 +352,17 @@ def play_game_self(model, n_sims, device, temp_moves=10, max_moves=120, eval_bat
 
     winner = state.winner()
     samples = []
-    for enc, pi, player in records:
+    for enc, pi, player, mcts_q in records:
         if winner == -1:
-            outcome = 0.0
+            game_outcome = 0.0
         elif winner == player:
-            outcome = 1.0
+            game_outcome = 1.0
         else:
-            outcome = -1.0
-        samples.append((enc, pi, outcome))
+            game_outcome = -1.0
+        # Blend MCTS root-Q with sparse game outcome.
+        # MCTS Q is a richer, per-position signal; game outcome anchors it to reality.
+        value_target = 0.75 * mcts_q + 0.25 * game_outcome
+        samples.append((enc, pi, value_target))
     return samples
 
 
@@ -372,9 +379,9 @@ def play_game_vs_naive(model, n_sims, device, model_plays_x=True, max_moves=120,
     while not state.is_terminal() and move_num < max_moves:
         current = state.current_player()
         if current == model_player:
-            pi = mcts_search(model, state, n_sims, device, temperature=1.0, eval_batch=eval_batch)
+            pi, mcts_q = mcts_search(model, state, n_sims, device, temperature=1.0, eval_batch=eval_batch)
             enc = state.encode()
-            records.append((enc, pi, model_player))
+            records.append((enc, pi, model_player, mcts_q))
             action = pick_action_from_pi(state, pi)
         else:
             action = state.naive_move()
@@ -385,14 +392,15 @@ def play_game_vs_naive(model, n_sims, device, model_plays_x=True, max_moves=120,
 
     winner = state.winner()
     samples = []
-    for enc, pi, player in records:
+    for enc, pi, player, mcts_q in records:
         if winner == -1:
-            outcome = 0.0
+            game_outcome = 0.0
         elif winner == player:
-            outcome = 1.0
+            game_outcome = 1.0
         else:
-            outcome = -1.0
-        samples.append((enc, pi, outcome))
+            game_outcome = -1.0
+        value_target = 0.75 * mcts_q + 0.25 * game_outcome
+        samples.append((enc, pi, value_target))
     return samples
 
 
@@ -436,7 +444,7 @@ def evaluate(candidate, champion, n_games, n_sims, device, it=0, max_moves=120, 
             current = state.current_player()
             is_cand = (cand_is_x and current == 0) or (not cand_is_x and current == 1)
             model = candidate if is_cand else champion
-            pi = mcts_search(model, state, n_sims, device, temperature=0.0, eval_batch=eval_batch)
+            pi, _ = mcts_search(model, state, n_sims, device, temperature=0.0, eval_batch=eval_batch)
             action = pick_action_from_pi(state, pi)
             state.place(action[0], action[1])
             move_num += 1
