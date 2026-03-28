@@ -488,7 +488,7 @@ def main():
     ap.add_argument("--buffer",             type=int,   default=30000,
                     help="Max replay buffer size")
     ap.add_argument("--eval-games",         type=int,   default=10)
-    ap.add_argument("--promote-threshold",  type=float, default=0.45,
+    ap.add_argument("--promote-threshold",  type=float, default=0.50,
                     help="Win-rate vs champion required to promote")
     ap.add_argument("--champion", default="hextoe_model_best.safetensors")
     ap.add_argument("--latest",   default="hextoe_model_latest.safetensors")
