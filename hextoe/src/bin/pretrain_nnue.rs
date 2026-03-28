@@ -86,8 +86,10 @@ fn main() {
     let mut rng = rand::rngs::StdRng::seed_from_u64(42);
     let mut indices: Vec<usize> = (0..records.len()).collect();
     let t0 = Instant::now();
+    let mut best_loss = f32::MAX;
 
     for epoch in 1..=epochs {
+        let epoch_t0 = Instant::now();
         indices.shuffle(&mut rng);
         let mut epoch_loss = 0.0f32;
         let mut epoch_steps = 0usize;
@@ -99,20 +101,31 @@ fn main() {
                     epoch_loss += loss;
                     epoch_steps += 1;
                 }
-                Ok(None) => {} // batch had no NNUE features
+                Ok(None) => {}
                 Err(e) => eprintln!("nnue_train_step error: {e}"),
             }
         }
 
-        if epoch % 20 == 0 || epoch == 1 || epoch == epochs {
-            let mean_loss =
-                if epoch_steps > 0 { epoch_loss / epoch_steps as f32 } else { 0.0 };
-            println!(
-                "epoch {:4}/{epochs}  loss {mean_loss:.5}  ({:.1}s elapsed)",
-                epoch,
-                t0.elapsed().as_secs_f64()
-            );
-        }
+        let mean_loss = if epoch_steps > 0 { epoch_loss / epoch_steps as f32 } else { 0.0 };
+        let improved = mean_loss < best_loss;
+        if improved { best_loss = mean_loss; }
+
+        let elapsed = t0.elapsed().as_secs_f64();
+        let secs_per_epoch = epoch_t0.elapsed().as_secs_f64();
+        let eta_secs = secs_per_epoch * (epochs - epoch) as f64;
+        let (eta_val, eta_unit) = if eta_secs >= 3600.0 {
+            (eta_secs / 3600.0, "h")
+        } else if eta_secs >= 60.0 {
+            (eta_secs / 60.0, "m")
+        } else {
+            (eta_secs, "s")
+        };
+        let marker = if improved { " ↓" } else { "  " };
+        println!(
+            "epoch {:4}/{epochs}  loss {mean_loss:.5}{marker}  best {best_loss:.5}  \
+             {secs_per_epoch:.1}s/ep  ETA {eta_val:.1}{eta_unit}  (total {elapsed:.0}s)",
+            epoch,
+        );
     }
 
     match nnue_varmap.save(&out_path) {
