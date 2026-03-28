@@ -1,0 +1,15 @@
+[package]
+name = "hextoe-py"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "hextoe_py"
+crate-type = ["cdylib"]
+
+[dependencies]
+hextoe = { path = "../hextoe" }
+pyo3 = { version = "0.22", features = ["extension-module"] }
+numpy = "0.22"
+ndarray = "0.16"
+rand = "0.8"

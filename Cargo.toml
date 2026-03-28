@@ -1,5 +1,5 @@
 [workspace]
-members = ["hextoe"]
+members = ["hextoe", "hextoe-py"]
 resolver = "2"
 
 
