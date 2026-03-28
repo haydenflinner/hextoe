@@ -14,7 +14,7 @@ use rand::Rng;
 
 use crate::encode::{action_to_index, board_center, encode_state, index_to_action, CHANNELS, GRID};
 use crate::game::{GameState, Player, Pos};
-use crate::mcts::{compound_threat_priors, RandomRollout, RolloutPolicy, MAX_GAME_MOVES};
+use crate::mcts::{compound_threat_priors, naive_best_move, RandomRollout, RolloutPolicy, MAX_GAME_MOVES};
 
 const HIDDEN: usize = 64;
 const RES_BLOCKS: usize = 4;
@@ -312,6 +312,27 @@ fn nn_priors(net: &HextoeNet, device: &Device, state: &GameState) -> Option<Vec<
     )
 }
 
+/// Run a short tactical rollout from `state` using naive best-move for both sides.
+/// Returns +1.0 if `root_player` wins, -1.0 if they lose, 0.0 if undecided within `depth`.
+/// Used to correct the NN value when tactical threats are present on the board.
+fn tactical_rollout_value(state: &GameState, root_player: Player, depth: usize) -> f32 {
+    let mut s = state.clone();
+    for _ in 0..depth {
+        if s.is_terminal() {
+            break;
+        }
+        match naive_best_move(&s) {
+            Some(mv) => { s.place(mv); }
+            None => break,
+        }
+    }
+    match s.winner {
+        Some(p) if p == root_player => 1.0,
+        Some(_) => -1.0,
+        None => 0.0,
+    }
+}
+
 /// Evaluate a leaf position with the NN, returning `(value, child_priors)` in one pass.
 fn nn_leaf_eval(
     net: &HextoeNet,
@@ -332,12 +353,31 @@ fn nn_leaf_eval(
     match net.evaluate_state(state, device) {
         Ok((probs, v)) => {
             let cp = state.current_player();
-            let value = if cp == root_player { v } else { -v };
+            let nn_value = if cp == root_player { v } else { -v };
             let legal = state.legal_actions();
             let me = state.current_player();
             let opp = me.other();
             let tac_raw = compound_threat_priors(state, &legal, me, opp);
             let tac_max = tac_raw.iter().map(|(_, w)| *w).fold(0.0f32, f32::max);
+
+            // When significant tactical threats are present, the NN value is often
+            // miscalibrated (it sees "opponent has N-in-a-row" and evaluates as losing
+            // even after a correct block). Blend with a short tactical rollout which
+            // plays both sides optimally and finds the real outcome.
+            let value = if tac_max >= 60.0 {
+                // Threshold 60 = at least a 4-in-a-row must-block situation.
+                let tac_value = tactical_rollout_value(state, root_player, 24);
+                if tac_value != 0.0 {
+                    // Rollout reached a decisive outcome — trust it heavily.
+                    0.2 * nn_value + 0.8 * tac_value
+                } else {
+                    // Rollout was inconclusive — split evenly.
+                    0.5 * nn_value + 0.5 * tac_value
+                }
+            } else {
+                nn_value
+            };
+
             let tac_map: std::collections::HashMap<Pos, f32> = if tac_max > 1.0 {
                 let total: f32 = tac_raw.iter().map(|(_, w)| w).sum();
                 tac_raw.into_iter().map(|(p, w)| (p, w / total)).collect()
