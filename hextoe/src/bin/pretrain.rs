@@ -4,8 +4,9 @@
 //!   hextoe-pretrain <games1.json> [games2.json ...] [--epochs N] [--batch-size B] [--lr LR] [--out path]
 //!
 //! Accepts one or more JSON files (pass a shell glob and the shell will expand it).
-//! Loads human game records, trains the dual-head network on them (value head learns
-//! win/loss, policy head learns to predict human moves), and saves the result.
+//! Loads compact raw move lists (not pre-expanded ×12 symmetries), builds a sample index,
+//! then encodes each batch on the fly with a random D₆ transform. Trains the dual-head
+//! network (value + policy) and saves the result.
 //! Run this once before self-play training to give the network a warm start.
 
 use std::path::Path;
@@ -14,12 +15,13 @@ use std::time::Instant;
 use candle_nn::optim::{AdamW, ParamsAdamW};
 use candle_nn::Optimizer;
 use rand::seq::SliceRandom;
+use rand::Rng;
 use rand::SeedableRng;
 
 use hextoe::device::default_inference_device;
 use hextoe::nn::build_model;
 use hextoe::self_play::GameRecord;
-use hextoe::supervised::load_supervised_records_multi;
+use hextoe::supervised::{build_sample_index, encode_sample, load_raw_games_multi};
 use hextoe::train::{train_step, DEFAULT_BEST_PATH, DEFAULT_LATEST_PATH};
 
 fn main() {
@@ -41,16 +43,17 @@ fn main() {
     let out_path = parse_arg_str(&args, "--out", DEFAULT_BEST_PATH);
 
     println!("Loading game data from {} file(s)…", json_paths.len());
-    let (records, used, skipped) = match load_supervised_records_multi(&json_paths) {
+    let (games, used, skipped) = match load_raw_games_multi(&json_paths) {
         Ok(x) => x,
         Err(e) => { eprintln!("Error loading games: {e}"); std::process::exit(1); }
     };
+    let sample_pairs = build_sample_index(&games);
     println!(
-        "Total: {} games used, {} skipped → {} positions",
-        used, skipped, records.len()
+        "Total: {} games used, {} skipped → {} trainable (game, step) samples (symmetry on-the-fly)",
+        used, skipped, sample_pairs.len()
     );
-    if records.is_empty() {
-        eprintln!("No usable records found.");
+    if sample_pairs.is_empty() {
+        eprintln!("No usable samples found.");
         std::process::exit(1);
     }
 
@@ -79,14 +82,14 @@ fn main() {
     let adam_params = ParamsAdamW { lr, weight_decay: 1e-4, ..Default::default() };
     let mut opt = AdamW::new(varmap.all_vars(), adam_params).expect("optimizer");
 
-    let steps_per_epoch = (records.len() + batch_size - 1) / batch_size;
+    let steps_per_epoch = (sample_pairs.len() + batch_size - 1) / batch_size;
     println!(
         "Training: {} epochs × {} steps/epoch (batch {}), lr={lr:.2e}",
         epochs, steps_per_epoch, batch_size
     );
 
     let mut rng = rand::rngs::StdRng::seed_from_u64(42);
-    let mut indices: Vec<usize> = (0..records.len()).collect();
+    let mut indices: Vec<usize> = (0..sample_pairs.len()).collect();
     let t0 = Instant::now();
 
     for epoch in 1..=epochs {
@@ -95,8 +98,19 @@ fn main() {
         let mut epoch_steps = 0usize;
 
         for chunk in indices.chunks(batch_size) {
-            let batch: Vec<&GameRecord> = chunk.iter().map(|&i| &records[i]).collect();
-            match train_step(&model, &batch, &device, &mut opt) {
+            let mut batch_owned: Vec<GameRecord> = Vec::with_capacity(chunk.len());
+            for &pi in chunk {
+                let (gi, si) = sample_pairs[pi];
+                let tid = rng.gen_range(0u8..12);
+                if let Some(rec) = encode_sample(&games, gi, si, tid) {
+                    batch_owned.push(rec);
+                }
+            }
+            if batch_owned.is_empty() {
+                continue;
+            }
+            let batch_refs: Vec<&GameRecord> = batch_owned.iter().collect();
+            match train_step(&model, &batch_refs, &device, &mut opt) {
                 Ok(loss) => {
                     epoch_loss += loss;
                     epoch_steps += 1;
