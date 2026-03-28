@@ -146,7 +146,7 @@ class MCTSNode:
         return self.value_sum / self.visit if self.visit > 0 else 0.0
 
     def ucb(self, parent_visit, c_puct):
-        return self.q() + c_puct * self.prior * (parent_visit ** 0.5) / (1 + self.visit)
+        return -self.q() + c_puct * self.prior * (parent_visit ** 0.5) / (1 + self.visit)
 
 
 def mcts_search(model, root_state, n_sims, device, c_puct=2.0, temperature=1.0):
@@ -202,13 +202,17 @@ def mcts_search(model, root_state, n_sims, device, c_puct=2.0, temperature=1.0):
     if pi.sum() == 0:
         pi[:] = 1.0 / G2
     else:
-        if temperature == 0 or temperature < 1e-6:
+        if temperature < 0.1:
             best = np.argmax(pi)
             pi[:] = 0.0
             pi[best] = 1.0
         else:
             pi = pi ** (1.0 / temperature)
-            pi /= pi.sum()
+            s = pi.sum()
+            if s == 0:
+                pi[:] = 1.0 / G2
+            else:
+                pi /= s
 
     return pi
 
