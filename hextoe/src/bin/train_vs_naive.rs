@@ -81,24 +81,20 @@ fn main() {
 
         // ── Self-play: NNUE vs Naive ─────────────────────────────────────────
         let mut sp_wins = 0usize;
+        let mut sp_losses = 0usize;
         let mut sp_games = 0usize;
         for g in 0..games_per {
-            // Alternate which side is naive so neither has a fixed advantage.
             let naive_player = if g % 2 == 0 { Player::X } else { Player::O };
-            let records = collector.play_game_vs_naive(mcts_iters, &mut rng, &rollout, naive_player);
-            // Count decisive outcomes for the NNUE player.
             let nnue_player = naive_player.other();
-            let won = records.iter().any(|r| {
-                // A record belongs to nnue_player if its outcome=+1 at a terminal position.
-                r.outcome == 1.0
-            });
-            // Approximate: if NNUE outcome > 0 on average, it won.
-            let nnue_avg: f32 = records.iter()
-                .filter(|r| !r.nnue_feats.is_empty())
-                .map(|r| r.outcome)
-                .sum::<f32>() / records.len().max(1) as f32;
-            if nnue_avg > 0.0 { sp_wins += 1; }
+            // Use eval_game_vs_naive so we get the actual winner, not a noisy average.
+            match collector.eval_game_vs_naive(mcts_iters, &mut rng, &rollout, naive_player) {
+                Some(w) if w == nnue_player => sp_wins += 1,
+                Some(_) => sp_losses += 1,
+                None => {}
+            }
             sp_games += 1;
+            // Also collect training records.
+            let records = collector.play_game_vs_naive(mcts_iters, &mut rng, &rollout, naive_player);
 
             for rec in records {
                 if buffer.len() >= buf_cap { buffer.pop_front(); }
@@ -138,8 +134,9 @@ fn main() {
         let iter_secs = t_iter.elapsed().as_secs_f64();
 
         println!(
-            "iter {:4}  buf {:5}  sp_wins {}/{} ({:3.0}%)  loss {:.4}  {:.1}s",
-            iter, buffer.len(), sp_wins, sp_games,
+            "iter {:4}  buf {:5}  W:{sp_wins} L:{sp_losses} D:{} ({:3.0}% win)  loss {:.4}  {:.1}s",
+            iter, buffer.len(),
+            sp_games - sp_wins - sp_losses,
             100.0 * sp_wins as f64 / sp_games.max(1) as f64,
             mean_loss, iter_secs
         );
