@@ -161,7 +161,8 @@ impl NNUENet {
         let b = features_batch.len();
         // fc0.weight is [L1_SIZE, N_FEATURES]; transpose to [N_FEATURES, L1_SIZE]
         // so we can index_select rows by active feature index.
-        let w0_t = self.fc0.weight().t()?;
+        // .contiguous() is required: index_select rejects non-contiguous views.
+        let w0_t = self.fc0.weight().t()?.contiguous()?;
         let b0 = self.fc0.bias().expect("fc0 bias required");
 
         let mut l1_rows: Vec<Tensor> = Vec::with_capacity(b);
