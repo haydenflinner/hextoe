@@ -372,38 +372,41 @@ mod tests {
         let state = GameState::new();
         let feats = encode_nnue(&state, (0, 0));
         assert_eq!(feats.len(), 1);
-        assert!(feats.contains(&N_AXIS_FEATURES)); // "X to move"
+        assert!(feats.contains(&(N_CELLS * 2))); // "X to move"
     }
 
     #[test]
-    fn encode_isolated_piece_activates_three_level0_features() {
-        // An isolated X piece has run=1 on all 3 axes → activates exactly 3 features
-        // (one per axis at threshold level 0).  After placing at (0,0) it's O's turn
-        // (1st of pair), so no turn features.
+    fn encode_isolated_piece_activates_one_feature() {
+        // One X piece at origin → one piece feature (cell_idx for X).
+        // After placing, it's O's turn (1st of pair) → no turn features.
         let mut state = GameState::new();
         state.place((0, 0)); // X anchor; total_moves=1 → O 1st of pair
         let feats = encode_nnue(&state, (0, 0));
-        // Only run-level features (< N_AXIS_FEATURES); no turn features.
-        let run_feats: Vec<_> = feats.iter().filter(|&&f| f < N_AXIS_FEATURES).collect();
-        assert_eq!(run_feats.len(), 3, "isolated piece: one level-0 feature per axis");
+        // Exactly one piece feature; no turn features.
+        let piece_feats: Vec<_> = feats.iter().filter(|&&f| f < N_CELLS * 2).collect();
+        assert_eq!(piece_feats.len(), 1, "one piece feature");
         assert!(feats.iter().all(|&f| f < N_FEATURES), "all indices in range");
     }
 
     #[test]
-    fn encode_run_activates_more_levels() {
-        // Two adjacent X pieces form a run-of-2 on one axis.
-        // total_moves=4 after placing anchor(X) + 2 O moves + 1 X move.
+    fn encode_x_and_o_use_different_offsets() {
+        // X piece at (0,0) and O piece at (1,0): they should use cell_idx and cell_idx+N_CELLS.
+        // total_moves=4 after anchor(X) + 2 O moves + 1 X move; X 2nd of pair → both turn bits.
         let mut state = GameState::new();
         state.place((0, 0)); // X, total_moves=1
         state.place((10, 0)); state.place((11, 0)); // O pair, total_moves=3
         state.place((1, 0)); // X, total_moves=4 → X 2nd of pair
-        // (0,0) and (1,0) are adjacent X pieces → run=2 on axis (1,0).
         let feats = encode_nnue(&state, (0, 0));
-        // Confirm all indices valid.
+        // All indices valid.
         assert!(feats.iter().all(|&f| f < N_FEATURES));
-        // X is still to move (2nd of pair) → both turn features should be active.
-        assert!(feats.contains(&N_AXIS_FEATURES),       "X to move");
-        assert!(feats.contains(&(N_AXIS_FEATURES + 1)), "2nd of pair");
+        // X piece features are in [0, N_CELLS), O features in [N_CELLS, N_CELLS*2).
+        let x_feats: Vec<_> = feats.iter().filter(|&&f| f < N_CELLS).collect();
+        let o_feats: Vec<_> = feats.iter().filter(|&&f| f >= N_CELLS && f < N_CELLS * 2).collect();
+        assert_eq!(x_feats.len(), 2, "two X pieces");
+        assert_eq!(o_feats.len(), 2, "two O pieces");
+        // Both turn features active (X to move, 2nd of pair).
+        assert!(feats.contains(&(N_CELLS * 2)),     "X to move");
+        assert!(feats.contains(&(N_CELLS * 2 + 1)), "2nd of pair");
     }
 
     #[test]
