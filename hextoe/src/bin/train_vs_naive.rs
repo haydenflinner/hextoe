@@ -60,6 +60,7 @@ fn main() {
     let mut rng = rand::rngs::StdRng::from_entropy();
     let mut buffer: VecDeque<GameRecord> = VecDeque::with_capacity(buf_cap);
     let mut streak = 0usize;
+    let mut best_rate = 0.0f64;
     let t_total = Instant::now();
 
     println!(
@@ -162,10 +163,13 @@ fn main() {
                 t_total.elapsed().as_secs_f64()
             );
 
-            if let Err(e) = varmap.save(&out_path) {
-                eprintln!("save failed: {e}");
-            } else {
-                println!("  Saved → {out_path}");
+            if rate > best_rate {
+                best_rate = rate;
+                if let Err(e) = varmap.save(&out_path) {
+                    eprintln!("save failed: {e}");
+                } else {
+                    println!("  Saved → {out_path}  (new best {:.1}%)", best_rate * 100.0);
+                }
             }
 
             if rate >= win_rate_thr {
