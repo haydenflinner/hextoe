@@ -71,6 +71,22 @@ pub trait RolloutPolicy {
 ///     4 — block opp 3-in-a-row
 ///     1 — normal move
 ///
+/// Straight open-four endpoints plus any empty candidate where the opponent would reach a
+/// run of ≥ 5 if they played there (same as compound `critical`, but cheap to precompute for
+/// [`naive_best_move`]).
+fn opp_merged_block_hints(state: &GameState, opp: Player) -> HashSet<Pos> {
+    let mut s = opp_straight_extension_blocks(&state.board, opp);
+    for &p in &state.candidates {
+        if state.board.contains_key(&p) {
+            continue;
+        }
+        if max_run_through(&state.board, p, opp) >= 5 {
+            s.insert(p);
+        }
+    }
+    s
+}
+
 /// `straight_opp_blocks` should be [`opp_straight_extension_blocks`] for this `board` and
 /// `opp` (reuse one set per position when scoring many cells).
 fn move_weight_core(
@@ -132,13 +148,13 @@ pub fn naive_best_move(state: &GameState) -> Option<Pos> {
     }
     let me = state.current_player();
     let opp = me.other();
-    let straight_blocks = opp_straight_extension_blocks(&state.board, opp);
+    let block_hints = opp_merged_block_hints(state, opp);
     actions
         .iter()
         .copied()
         .max_by(|&a, &b| {
-            move_weight_core(&state.board, a, me, opp, &straight_blocks)
-                .partial_cmp(&move_weight_core(&state.board, b, me, opp, &straight_blocks))
+            move_weight_core(&state.board, a, me, opp, &block_hints)
+                .partial_cmp(&move_weight_core(&state.board, b, me, opp, &block_hints))
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
 }
@@ -170,8 +186,11 @@ pub fn compound_threat_priors(
         .collect();
     let n = critical.len();
 
-    /// Prior weight for blocking an opponent straight run of 4+ when many five-threats exist.
-    const STRAIGHT_FOUR_BLOCK_PRIOR: f32 = 280.0;
+    /// When `n >= 3`, generic “critical” (opp five-extension) cells are noisy; **geometric**
+    /// endpoints of an existing straight run of 4+ ([`opp_straight_extension_blocks`]) are a
+    /// sharper signal and must outrank them so PUCT does not treat 50×300 ties as uniform.
+    const STRAIGHT_FOUR_BLOCK_PRIOR: f32 = 450.0;
+    const CRITICAL_FIVE_EXT_PRIOR: f32 = 300.0;
 
     actions.iter().map(|&pos| {
         let base = move_weight_core(&state.board, pos, me, opp, &straight_blocks);
@@ -183,11 +202,10 @@ pub fn compound_threat_priors(
                 base  // must still block opp's immediate win (op_max >= 6)
             } else if max_run_through(&state.board, pos, me) >= 5 {
                 600.0 // create own 5-threat: forces opp to defend, races their win
-            } else if critical.contains(&pos) {
-                300.0 // block one critical point (buys time, pair-mate still threatens)
             } else if straight_blocks.contains(&pos) {
-                // Still defend open four — do not flatten to 1.0 or MCTS ignores obvious blocks.
                 STRAIGHT_FOUR_BLOCK_PRIOR
+            } else if critical.contains(&pos) {
+                CRITICAL_FIVE_EXT_PRIOR
             } else {
                 1.0
             }
@@ -212,6 +230,28 @@ pub fn compound_threat_priors(
         };
         (pos, w)
     }).collect()
+}
+
+/// Raise prior weights before softmax so a few tactical moves (hundreds) do not drown in a sea
+/// of weight-1.0 legal cells (~PUCT gets ~uniform 1% visit share each).
+const TACTICAL_PRIOR_SHARPEN_POW: f32 = 2.35;
+
+fn sharpen_normalize_priors(raw: Vec<(Pos, f32)>) -> Vec<(Pos, f32)> {
+    let boosted: Vec<(Pos, f32)> = raw
+        .into_iter()
+        .map(|(p, w)| (p, w.max(1.0).powf(TACTICAL_PRIOR_SHARPEN_POW)))
+        .collect();
+    let sum: f32 = boosted.iter().map(|(_, w)| w).sum();
+    boosted.into_iter().map(|(p, w)| (p, w / sum)).collect()
+}
+
+fn finalize_tactical_priors(raw: Vec<(Pos, f32)>, num_actions: usize) -> Vec<(Pos, f32)> {
+    if num_actions >= 40 {
+        sharpen_normalize_priors(raw)
+    } else {
+        let sum: f32 = raw.iter().map(|(_, w)| w).sum();
+        raw.into_iter().map(|(p, w)| (p, w / sum)).collect()
+    }
 }
 
 /// Uniform random playouts (used by the GUI and benchmarks).
@@ -271,8 +311,7 @@ impl RolloutPolicy for RandomRollout {
         if max_w <= 1.0 {
             return None; // all moves equal weight → let UCB1 do its thing
         }
-        let total: f32 = raw.iter().map(|(_, w)| w).sum();
-        Some(raw.into_iter().map(|(p, w)| (p, w / total)).collect())
+        Some(finalize_tactical_priors(raw, actions.len()))
     }
 
     fn rollout(&self, mut state: GameState, root_player: Player, rng: &mut impl Rng) -> (f32, Option<Vec<(Pos, f32)>>) {
@@ -382,8 +421,7 @@ impl RolloutPolicy for TacticalRollout {
         if max_w <= 1.0 {
             return None;
         }
-        let total: f32 = raw.iter().map(|(_, w)| w).sum();
-        Some(raw.into_iter().map(|(p, w)| (p, w / total)).collect())
+        Some(finalize_tactical_priors(raw, actions.len()))
     }
 
     fn rollout(&self, mut state: GameState, root_player: Player, rng: &mut impl Rng) -> (f32, Option<Vec<(Pos, f32)>>) {
