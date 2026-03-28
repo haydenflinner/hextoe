@@ -18,7 +18,6 @@ use crate::encode::{CHANNELS, GRID};
 use crate::game::Player;
 use crate::mcts::{RandomRollout, RolloutPolicy};
 use crate::nn::{build_model, load_weights, save_weights, HextoeNet, LoadedNet, NeuralRollout};
-use crate::nnue::{build_nnue_model, NNUENet, NNUEWeights, NNUERollout, DEFAULT_NNUE_PATH};
 use crate::self_play::{GameRecord, ReplayBuffer, SelfPlayCollector};
 
 const LOG_CAP: usize = 400;
@@ -77,11 +76,6 @@ pub struct TrainingConfig {
     pub device: Device,
     /// If true, MCTS simulations use fast uniform random playouts instead of NN value at the leaf.
     pub use_random_rollout: bool,
-    /// If true, use the NNUE value network for leaf evaluation (pure CPU, fully parallel).
-    /// Takes precedence over `use_random_rollout` when both are set.
-    pub use_nnue_rollout: bool,
-    /// Path for the NNUE model checkpoint (saved/loaded alongside the CNN).
-    pub nnue_path: String,
     /// How many games to run in parallel during each self-play batch (`0` = Rayon thread count).
     ///
     /// With NN leaf evaluation on a GPU, [`parallel_game_count`] is effectively capped at `1` so
@@ -124,8 +118,6 @@ impl TrainingConfig {
             self_play_progress_every_n_moves: DEFAULT_SELF_PLAY_PROGRESS_EVERY_N_MOVES,
             device: default_inference_device(),
             use_random_rollout,
-            use_nnue_rollout: false,
-            nnue_path: DEFAULT_NNUE_PATH.to_string(),
             self_play_parallel_games: DEFAULT_SELF_PLAY_PARALLEL_GAMES,
             min_promotion_games: DEFAULT_MIN_PROMOTION_GAMES,
             max_stagnation_rounds: DEFAULT_MAX_STAGNATION_ROUNDS,
@@ -140,12 +132,6 @@ impl TrainingConfig {
     pub fn default_with_cli_rollout() -> Self {
         let mut cfg = Self::from_defaults(cli_use_random_rollout());
         cfg.population_size = cli_population_size();
-        if cli_use_nnue_rollout() {
-            cfg.use_nnue_rollout = true;
-            cfg.use_random_rollout = false;
-        } else if !cli_use_random_rollout() && Path::new(&cfg.nnue_path).exists() {
-            cfg.use_nnue_rollout = true;
-        }
         if std::env::args().skip(1).any(|a| a == "--naive-opponent") {
             cfg.use_naive_opponent = true;
         }
@@ -156,11 +142,6 @@ impl TrainingConfig {
 /// True if argv contains `--random-rollout` or `-r`.
 pub fn cli_use_random_rollout() -> bool {
     std::env::args().skip(1).any(|a| a == "--random-rollout" || a == "-r")
-}
-
-/// True if argv contains `--nnue` (use NNUE leaf evaluation for self-play).
-pub fn cli_use_nnue_rollout() -> bool {
-    std::env::args().skip(1).any(|a| a == "--nnue")
 }
 
 /// True if argv contains `--one-checkpoint` (for `hextoe-train` profiling runs).
@@ -191,10 +172,6 @@ pub fn parallel_game_count(config: &TrainingConfig) -> usize {
         0 => rayon::current_num_threads().max(1),
         n => n.max(1),
     };
-    // NNUE is always pure CPU + Arc — fully parallel.
-    if config.use_nnue_rollout {
-        return n;
-    }
     // Metal NN rollout: serial only.
     if !config.use_random_rollout && !matches!(config.device, Device::Cpu) {
         return 1;
@@ -234,7 +211,6 @@ pub struct TrainingMonitor {
     pub last_checkpoint_msg: Option<String>,
     pub last_promotion_msg: Option<String>,
     pub use_random_rollout: bool,
-    pub use_nnue_rollout: bool,
     pub self_play_parallel_games: usize,
     pub log: VecDeque<String>,
 }
@@ -262,7 +238,6 @@ impl TrainingMonitor {
             last_checkpoint_msg: None,
             last_promotion_msg: None,
             use_random_rollout: config.use_random_rollout,
-            use_nnue_rollout: config.use_nnue_rollout,
             self_play_parallel_games: parallel_game_count(config),
             log: VecDeque::with_capacity(LOG_CAP.min(32)),
         }
@@ -872,27 +847,7 @@ pub fn run_training(
     let mut one_checkpoint_buffer_hinted = false;
     let mut consecutive_failures = 0u32;
 
-    // ── NNUE model (always built; trained alongside CNN; used for rollout when --nnue) ──
-    let (mut nnue_varmap, nnue_model) = {
-        let vm = VarMap::new();
-        let vb = VarBuilder::from_varmap(&vm, DType::F32, &Device::Cpu);
-        let net = NNUENet::new(vb).expect("NNUE build");
-        (vm, net)
-    };
-    if Path::new(&config.nnue_path).is_file() {
-        match nnue_varmap.load(&config.nnue_path) {
-            Ok(()) => log_line(&monitor, log_stdout, &format!("NNUE: loaded from {}", config.nnue_path)),
-            Err(e) => log_line(&monitor, log_stdout, &format!("NNUE: could not load ({}), starting fresh", e)),
-        }
-    } else {
-        log_line(&monitor, log_stdout, "NNUE: no checkpoint found, starting with random weights");
-    }
-    let nnue_adam = ParamsAdamW { lr: config.lr, weight_decay: config.weight_decay, ..Default::default() };
-    let mut nnue_opt = AdamW::new(nnue_varmap.all_vars(), nnue_adam)?;
-
-    let rollout_note = if config.use_nnue_rollout {
-        "NNUE leaf value (parallel)"
-    } else if config.use_random_rollout {
+    let rollout_note = if config.use_random_rollout {
         "random playouts"
     } else {
         "CNN leaf value"
@@ -929,9 +884,7 @@ pub fn run_training(
             }
         }
 
-        let sp_rollout_note = if config.use_nnue_rollout {
-            "NNUE leaf value"
-        } else if config.use_random_rollout {
+        let sp_rollout_note = if config.use_random_rollout {
             "random playouts"
         } else {
             "CNN leaf value"
