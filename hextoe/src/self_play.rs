@@ -215,15 +215,14 @@ impl SelfPlayCollector {
 
     /// Play one game where `naive_player` uses a greedy [`NaiveRollout`] (no MCTS — just
     /// argmax of own-run-extension priors) and the other player uses full MCTS with
-    /// `rollout`. Records are collected for both sides so the trained bot sees the naive
-    /// bot's positions with their outcomes.
+    /// `rollout`. Returns `(records, winner)` — winner is `None` if the move limit was hit.
     pub fn play_game_vs_naive<R: Rng, P: RolloutPolicy>(
         &self,
         mcts_iters: u32,
         rng: &mut R,
         rollout: &P,
         naive_player: Player,
-    ) -> Vec<GameRecord> {
+    ) -> (Vec<GameRecord>, Option<Player>) {
         let naive = NaiveRollout;
         let mut state = GameState::new();
         let mut steps: Vec<([f32; CHANNELS * GRID * GRID], [f32; GRID * GRID], Player, Vec<u16>)> =
@@ -279,7 +278,7 @@ impl SelfPlayCollector {
         }
 
         let winner = state.winner;
-        steps
+        let records = steps
             .into_iter()
             .map(|(state_enc, pi, player, nnue_feats)| {
                 let outcome = match winner {
@@ -289,7 +288,8 @@ impl SelfPlayCollector {
                 };
                 GameRecord { state_enc: Box::new(state_enc), pi: Box::new(pi), outcome, nnue_feats }
             })
-            .collect()
+            .collect();
+        (records, winner)
     }
 
     /// Play one eval game: trained rollout vs naive bot. Returns `Some(winner)` or `None`

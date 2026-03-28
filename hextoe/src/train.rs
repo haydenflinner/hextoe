@@ -330,7 +330,7 @@ pub fn self_play_until_duration<P: RolloutPolicy + Send + Sync>(
             let use_naive = config.use_naive_opponent && game_i % 2 == 0;
             let naive_player = if rng.gen::<bool>() { crate::game::Player::X } else { crate::game::Player::O };
             let records = if use_naive {
-                collector.play_game_vs_naive(config.mcts_iters_per_move, rng, rollout, naive_player)
+                collector.play_game_vs_naive(config.mcts_iters_per_move, rng, rollout, naive_player).0
             } else { collector.play_game_with_progress(
                 config.mcts_iters_per_move,
                 rng,

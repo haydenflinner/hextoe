@@ -86,15 +86,13 @@ fn main() {
         for g in 0..games_per {
             let naive_player = if g % 2 == 0 { Player::X } else { Player::O };
             let nnue_player = naive_player.other();
-            // Use eval_game_vs_naive so we get the actual winner, not a noisy average.
-            match collector.eval_game_vs_naive(mcts_iters, &mut rng, &rollout, naive_player) {
+            let (records, winner) = collector.play_game_vs_naive(mcts_iters, &mut rng, &rollout, naive_player);
+            match winner {
                 Some(w) if w == nnue_player => sp_wins += 1,
                 Some(_) => sp_losses += 1,
                 None => {}
             }
             sp_games += 1;
-            // Also collect training records.
-            let records = collector.play_game_vs_naive(mcts_iters, &mut rng, &rollout, naive_player);
 
             for rec in records {
                 if buffer.len() >= buf_cap { buffer.pop_front(); }
