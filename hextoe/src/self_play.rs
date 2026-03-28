@@ -292,6 +292,39 @@ impl SelfPlayCollector {
             .collect()
     }
 
+    /// Play one eval game: trained rollout vs naive bot. Returns `Some(winner)` or `None`
+    /// if the game hit the move limit. The naive player is `naive_player`.
+    pub fn eval_game_vs_naive<R: Rng, P: RolloutPolicy>(
+        &self,
+        mcts_iters: u32,
+        rng: &mut R,
+        rollout: &P,
+        naive_player: Player,
+    ) -> Option<Player> {
+        let naive = NaiveRollout;
+        let mut state = GameState::new();
+        let mut move_count = 0u32;
+        loop {
+            if state.is_terminal() || move_count >= MAX_GAME_MOVES { break; }
+            let current_player = state.current_player();
+            let chosen = if current_player == naive_player {
+                naive.priors_only(&state)
+                    .and_then(|p| p.into_iter().max_by(|a, b| a.1.partial_cmp(&b.1).unwrap()))
+                    .map(|(pos, _)| pos)
+                    .unwrap_or_else(|| state.legal_actions()[0])
+            } else {
+                let mut mcts = Mcts::new(state.clone());
+                mcts.search_iters(mcts_iters, rng, rollout);
+                let stats = mcts.root_children_stats();
+                stats.into_iter().max_by_key(|(_, v)| *v).map(|(p, _)| p)
+                    .unwrap_or_else(|| state.legal_actions()[0])
+            };
+            state.place(chosen);
+            move_count += 1;
+        }
+        state.winner
+    }
+
     /// One full game between two networks (MCTS + neural rollouts). `new_player` is which
     /// side uses `new_net`; the other uses `best_net`. Returns the winner, if any.
     pub fn play_match_game<R: Rng>(
