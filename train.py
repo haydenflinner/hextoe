@@ -143,7 +143,7 @@ def train_step(model, states, policies, values, opt, device):
     log_p = F.log_softmax(policy_logits, dim=1)
     policy_loss = -(policies * log_p).sum(dim=1).mean()
     value_loss = F.mse_loss(value_out, values)
-    loss = policy_loss + value_loss
+    loss = policy_loss + 4.0 * value_loss
 
     opt.zero_grad()
     loss.backward()
