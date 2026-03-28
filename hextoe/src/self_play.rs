@@ -23,6 +23,8 @@ pub struct GameRecord {
     /// NNUE sparse feature indices (u16; fits since N_FEATURES < 65536).
     /// Empty only for records loaded from pre-NNUE checkpoints.
     pub nnue_feats: Vec<u16>,
+    /// Board center at the time this record was created, used to index pi.
+    pub center: Pos,
 }
 
 // ── Replay buffer ─────────────────────────────────────────────────────────────
@@ -126,8 +128,8 @@ impl SelfPlayCollector {
         F: FnMut(u32, Duration),
     {
         let mut state = GameState::new();
-        // Temporary storage: (encoded_state, pi, player_to_move, nnue_feats)
-        let mut steps: Vec<([f32; CHANNELS * GRID * GRID], [f32; GRID * GRID], Player, Vec<u16>)> =
+        // Temporary storage: (encoded_state, pi, player_to_move, nnue_feats, center)
+        let mut steps: Vec<([f32; CHANNELS * GRID * GRID], [f32; GRID * GRID], Player, Vec<u16>, Pos)> =
             Vec::new();
         let mut move_count = 0u32;
 
@@ -186,7 +188,7 @@ impl SelfPlayCollector {
                 chosen
             };
 
-            steps.push((state_enc, pi, current_player, nnue_feats));
+            steps.push((state_enc, pi, current_player, nnue_feats, center));
             state.place(chosen_pos);
             move_count += 1;
         }
@@ -197,7 +199,7 @@ impl SelfPlayCollector {
         let winner = state.winner;
         steps
             .into_iter()
-            .map(|(state_enc, pi, player, nnue_feats)| {
+            .map(|(state_enc, pi, player, nnue_feats, center)| {
                 let outcome = match winner {
                     Some(w) if w == player => 1.0,
                     Some(_) => -1.0,
@@ -208,6 +210,7 @@ impl SelfPlayCollector {
                     pi: Box::new(pi),
                     outcome,
                     nnue_feats,
+                    center,
                 }
             })
             .collect()
@@ -225,7 +228,7 @@ impl SelfPlayCollector {
     ) -> (Vec<GameRecord>, Option<Player>) {
         let naive = NaiveRollout;
         let mut state = GameState::new();
-        let mut steps: Vec<([f32; CHANNELS * GRID * GRID], [f32; GRID * GRID], Player, Vec<u16>)> =
+        let mut steps: Vec<([f32; CHANNELS * GRID * GRID], [f32; GRID * GRID], Player, Vec<u16>, Pos)> =
             Vec::new();
         let mut move_count = 0u32;
 
@@ -272,7 +275,7 @@ impl SelfPlayCollector {
                 pi[idx] = 1.0;
             }
 
-            steps.push((state_enc, pi, current_player, nnue_feats));
+            steps.push((state_enc, pi, current_player, nnue_feats, center));
             state.place(chosen_pos);
             move_count += 1;
         }
@@ -280,13 +283,13 @@ impl SelfPlayCollector {
         let winner = state.winner;
         let records = steps
             .into_iter()
-            .map(|(state_enc, pi, player, nnue_feats)| {
+            .map(|(state_enc, pi, player, nnue_feats, center)| {
                 let outcome = match winner {
                     Some(w) if w == player => 1.0,
                     Some(_) => -1.0,
                     None => state.board_heuristic(player),
                 };
-                GameRecord { state_enc: Box::new(state_enc), pi: Box::new(pi), outcome, nnue_feats }
+                GameRecord { state_enc: Box::new(state_enc), pi: Box::new(pi), outcome, nnue_feats, center }
             })
             .collect();
         (records, winner)
@@ -423,7 +426,7 @@ impl SelfPlayCollector {
         P2: RolloutPolicy,
     {
         let mut state = GameState::new();
-        let mut steps: Vec<([f32; CHANNELS * GRID * GRID], [f32; GRID * GRID], Player, Vec<u16>)> =
+        let mut steps: Vec<([f32; CHANNELS * GRID * GRID], [f32; GRID * GRID], Player, Vec<u16>, Pos)> =
             Vec::new();
         let mut move_count = 0u32;
 
@@ -468,19 +471,19 @@ impl SelfPlayCollector {
                 }
             }
 
-            steps.push((state_enc, pi, current_player, nnue_feats));
+            steps.push((state_enc, pi, current_player, nnue_feats, center));
             state.place(chosen_pos);
             move_count += 1;
         }
 
         let winner = state.winner;
-        let records = steps.into_iter().map(|(state_enc, pi, player, nnue_feats)| {
+        let records = steps.into_iter().map(|(state_enc, pi, player, nnue_feats, center)| {
             let outcome = match winner {
                 Some(w) if w == player => 1.0,
                 Some(_) => -1.0,
                 None => state.board_heuristic(player),
             };
-            GameRecord { state_enc: Box::new(state_enc), pi: Box::new(pi), outcome, nnue_feats }
+            GameRecord { state_enc: Box::new(state_enc), pi: Box::new(pi), outcome, nnue_feats, center }
         }).collect();
         (records, winner)
     }

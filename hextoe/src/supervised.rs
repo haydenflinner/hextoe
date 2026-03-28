@@ -253,6 +253,7 @@ fn process_game(game: &GameJson) -> Option<Vec<GameRecord>> {
                 pi: Box::new(pi),
                 outcome,
                 nnue_feats,
+                center: tc,
             });
         }
     }

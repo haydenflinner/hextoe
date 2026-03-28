@@ -30,7 +30,7 @@ use candle_core::{Device, DType, Result as CResult, Tensor};
 use candle_nn::{linear, Linear, Module, VarBuilder, VarMap};
 use rand::Rng;
 
-use crate::encode::board_center;
+use crate::encode::{action_to_index, board_center, GRID};
 use crate::game::{max_run_through, GameState, Player, Pos};
 use crate::mcts::RolloutPolicy;
 
@@ -105,6 +105,7 @@ pub struct NNUENet {
     fc1: Linear,
     fc2: Linear,
     fc3: Linear,
+    fc_policy: Linear,
 }
 
 impl NNUENet {
@@ -114,15 +115,30 @@ impl NNUENet {
             fc1: linear(L1_SIZE, L2_SIZE, vb.pp("fc1"))?,
             fc2: linear(L2_SIZE, L3_SIZE, vb.pp("fc2"))?,
             fc3: linear(L3_SIZE, 1, vb.pp("fc3"))?,
+            fc_policy: linear(L3_SIZE, GRID * GRID, vb.pp("policy"))?,
         })
+    }
+
+    /// Compute the shared trunk (L1/L2/L3 layers). Returns L3 tensor `[batch, L3_SIZE]`.
+    fn forward_trunk(&self, x: &Tensor) -> CResult<Tensor> {
+        let x = self.fc0.forward(x)?.clamp(0f32, 1f32)?;
+        let x = self.fc1.forward(&x)?.clamp(0f32, 1f32)?;
+        self.fc2.forward(&x)?.clamp(0f32, 1f32)
     }
 
     /// Forward on dense input `[batch, N_FEATURES]`. Returns value `[batch, 1]` in `[-1,1]`.
     pub fn forward(&self, x: &Tensor) -> CResult<Tensor> {
-        let x = self.fc0.forward(x)?.clamp(0f32, 1f32)?;
-        let x = self.fc1.forward(&x)?.clamp(0f32, 1f32)?;
-        let x = self.fc2.forward(&x)?.clamp(0f32, 1f32)?;
-        self.fc3.forward(&x)?.tanh()
+        let l3 = self.forward_trunk(x)?;
+        self.fc3.forward(&l3)?.tanh()
+    }
+
+    /// Forward returning both value and policy logits.
+    /// Returns `(value [batch,1], policy_logits [batch, GRID*GRID])`.
+    pub fn forward_value_and_policy(&self, x: &Tensor) -> CResult<(Tensor, Tensor)> {
+        let l3 = self.forward_trunk(x)?;
+        let value = self.fc3.forward(&l3)?.tanh()?;
+        let policy = self.fc_policy.forward(&l3)?;
+        Ok((value, policy))
     }
 
     /// Build a dense `[batch, N_FEATURES]` tensor from a batch of sparse feature lists.
@@ -160,6 +176,8 @@ pub struct NNUEWeights {
     b2: Vec<f32>, // [L3_SIZE]
     w3: Vec<f32>, // [L3_SIZE]  (output neuron weights)
     b3: f32,
+    w_policy: Option<Vec<f32>>, // row-major [GRID*GRID, L3_SIZE]
+    b_policy: Option<Vec<f32>>, // [GRID*GRID]
 }
 
 impl NNUEWeights {
@@ -174,6 +192,9 @@ impl NNUEWeights {
                 w0_col[in_j * L1_SIZE + out_i] = w0_row[out_i * N_FEATURES + in_j];
             }
         }
+        // Try to load policy weights; use None for old checkpoints that lack them.
+        let w_policy = get("policy.weight").ok();
+        let b_policy = get("policy.bias").ok();
         Ok(Self {
             w0: w0_col,
             b0: get("fc0.bias")?,
@@ -183,6 +204,8 @@ impl NNUEWeights {
             b2: get("fc2.bias")?,
             w3: get("fc3.weight")?,
             b3: get("fc3.bias")?[0],
+            w_policy,
+            b_policy,
         })
     }
 
@@ -208,10 +231,8 @@ impl NNUEWeights {
         })
     }
 
-    /// Evaluate a position from its sparse feature list.
-    ///
-    /// Returns value from X's perspective in `[-1, 1]`.
-    pub fn eval_sparse(&self, features: &[usize]) -> f32 {
+    /// Compute L1→L2→L3 activations from sparse feature indices.
+    fn compute_l3(&self, features: &[usize]) -> Vec<f32> {
         // ── L0 accumulator ────────────────────────────────────────────────────
         let mut acc = self.b0.clone();
         for &f in features {
@@ -244,12 +265,71 @@ impl NNUEWeights {
             *v = v.clamp(0.0, 1.0);
         }
 
+        l3
+    }
+
+    /// Evaluate a position from its sparse feature list.
+    ///
+    /// Returns value from X's perspective in `[-1, 1]`.
+    pub fn eval_sparse(&self, features: &[usize]) -> f32 {
+        let l3 = self.compute_l3(features);
+
         // ── L3 → output ──────────────────────────────────────────────────────
         let mut out = self.b3;
         for (i, &v) in l3.iter().enumerate() {
             out += v * self.w3[i];
         }
         out.tanh()
+    }
+
+    /// Evaluate policy priors for each action in `actions`.
+    ///
+    /// Returns `None` if the policy head weights are not loaded (old checkpoint).
+    /// Otherwise returns `Some(Vec<(Pos, f32)>)` with softmax probabilities.
+    pub fn eval_policy_sparse(
+        &self,
+        features: &[usize],
+        center: Pos,
+        actions: &[Pos],
+    ) -> Option<Vec<(Pos, f32)>> {
+        let w_policy = self.w_policy.as_ref()?;
+        let b_policy = self.b_policy.as_ref()?;
+
+        let l3 = self.compute_l3(features);
+
+        // Compute logits for each action.
+        let mut scores: Vec<(Pos, f32)> = Vec::with_capacity(actions.len());
+        for &pos in actions {
+            let Some(idx) = action_to_index(pos, center) else { continue };
+            if idx >= GRID * GRID {
+                continue;
+            }
+            let logit = b_policy[idx]
+                + l3.iter()
+                    .zip(&w_policy[idx * L3_SIZE..(idx + 1) * L3_SIZE])
+                    .map(|(&a, &w)| a * w)
+                    .sum::<f32>();
+            scores.push((pos, logit));
+        }
+
+        if scores.is_empty() {
+            return Some(vec![]);
+        }
+
+        // Softmax with numerical stability (subtract max).
+        let max_logit = scores.iter().map(|(_, s)| *s).fold(f32::NEG_INFINITY, f32::max);
+        let mut sum_exp = 0.0f32;
+        for (_, s) in &mut scores {
+            *s = (*s - max_logit).exp();
+            sum_exp += *s;
+        }
+        if sum_exp > 0.0 {
+            for (_, s) in &mut scores {
+                *s /= sum_exp;
+            }
+        }
+
+        Some(scores)
     }
 }
 
@@ -313,9 +393,8 @@ impl RolloutPolicy for NNUERollout {
         (self.eval_state(&state, root_player), None)
     }
 
-    /// Return compound-threat-aware priors so PUCT focuses the search budget on
-    /// the most tactically relevant moves first.  Uses [`compound_threat_priors`]
-    /// which handles both per-move heuristics and board-level multi-threat detection.
+    /// Return policy priors for PUCT, using the learned policy head when available,
+    /// falling back to compound threat heuristics otherwise.
     fn priors_only(&self, state: &GameState) -> Option<Vec<(Pos, f32)>> {
         let actions = state.legal_actions();
         if actions.is_empty() {
@@ -324,6 +403,19 @@ impl RolloutPolicy for NNUERollout {
         let me = state.current_player();
         let opp = me.other();
 
+        let center = board_center(state);
+        let feats = encode_nnue(state, center);
+
+        // Use learned policy if it's non-uniform (has trained).
+        if let Some(policy) = self.weights.eval_policy_sparse(&feats, center, &actions) {
+            let uniform = 1.0 / actions.len() as f32;
+            let max_p = policy.iter().map(|(_, p)| *p).fold(0.0f32, f32::max);
+            if max_p > uniform * 1.5 {
+                return Some(policy);
+            }
+        }
+
+        // Fallback: compound threat heuristics.
         let raw = crate::mcts::compound_threat_priors(state, &actions, me, opp);
         let max_w = raw.iter().map(|(_, w)| *w).fold(0.0f32, f32::max);
         if max_w <= 1.0 {

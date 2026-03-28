@@ -1,9 +1,10 @@
 use hextoe::api::{start_api_server, GameUpdate};
 use hextoe::device::default_inference_device;
+use hextoe::encode::board_center;
 use hextoe::game::{winning_line, GameState, Player, Pos};
 use hextoe::mcts::{Mcts, RandomRollout};
 use hextoe::nn::{LoadedNet, NeuralRollout};
-use hextoe::nnue::{NNUERollout, NNUEWeights, DEFAULT_NNUE_PATH};
+use hextoe::nnue::{encode_nnue, NNUERollout, NNUEWeights, DEFAULT_NNUE_PATH};
 use hextoe::train::default_inference_checkpoint_path;
 
 use candle_core::Device as CandleDevice;
@@ -79,6 +80,10 @@ struct App {
     last_api_msg: Option<Instant>,
     /// Most recently saved game file path + when it was saved.
     last_save: Option<(Instant, String)>,
+    /// Policy prior for each candidate cell (from learned policy head).
+    policy_heatmap: Vec<(Pos, f32)>,
+    /// NNUE value estimate for current position (+1 = current player winning).
+    value_estimate: Option<f32>,
 }
 
 impl App {
@@ -108,6 +113,8 @@ impl App {
             last_api_msg: None,
             last_save: None,
             online_mode: false,
+            policy_heatmap: vec![],
+            value_estimate: None,
         };
         app.restart_mcts();
         app
@@ -177,6 +184,20 @@ impl App {
         });
 
         self.result_rx = Some(rx);
+
+        // Synchronously compute policy heatmap and value estimate for NNUE mode.
+        if self.rollout_mode == RolloutMode::Nnue && self.nnue_checkpoint_hint {
+            if let Ok(w) = NNUEWeights::load(DEFAULT_NNUE_PATH, &candle_core::Device::Cpu) {
+                let center = board_center(&self.game);
+                let feats = encode_nnue(&self.game, center);
+                let actions = self.game.legal_actions();
+                self.policy_heatmap = w.eval_policy_sparse(&feats, center, &actions).unwrap_or_default();
+                self.value_estimate = Some(w.eval_sparse(&feats));
+            }
+        } else {
+            self.policy_heatmap = vec![];
+            self.value_estimate = None;
+        }
     }
 
     fn handle_click(&mut self, pos: Pos) {
@@ -196,6 +217,8 @@ impl App {
         self.last_pos = None;
         self.pan_offset = egui::Vec2::ZERO;
         self.online_mode = false;
+        self.policy_heatmap = vec![];
+        self.value_estimate = None;
         self.restart_mcts();
     }
 }
@@ -328,6 +351,7 @@ fn cell_fill(
     win_cells: &std::collections::HashSet<Pos>,
     suggestion_rank: Option<usize>,
     hovered: Option<Pos>,
+    policy_prior: f32,
 ) -> Color32 {
     if let Some(player) = game.board.get(&pos) {
         return if win_cells.contains(&pos) {
@@ -348,6 +372,14 @@ fn cell_fill(
             1 => Color32::from_rgb(130, 190, 45),
             _ => Color32::from_rgb(175, 190, 45),
         };
+    }
+    if policy_prior > 0.0 {
+        let t = (policy_prior * 12.0).min(1.0);
+        return Color32::from_rgb(
+            (52.0 * (1.0 - t) + 30.0 * t) as u8,
+            (52.0 * (1.0 - t) + 160.0 * t) as u8,
+            (52.0 * (1.0 - t) + 60.0 * t) as u8,
+        );
     }
     Color32::from_gray(52)
 }
@@ -447,6 +479,14 @@ impl eframe::App for App {
                                 },
                             );
                         });
+                }
+
+                ui.add_space(4.0);
+                if let Some(v) = self.value_estimate {
+                    let pct = (v * 50.0 + 50.0) as i32;
+                    let player = self.game.current_player();
+                    let label = format!("Position: {pct}% for {player:?}");
+                    ui.label(RichText::new(label).size(12.0));
                 }
 
                 ui.add_space(8.0);
@@ -716,7 +756,11 @@ impl eframe::App for App {
 
                 let sug_rank = suggestion_map.get(pos).map(|&(r, _, _, _)| r);
                 let corners: Vec<Pos2> = hex_corners(centre, hs - 1.5).into();
-                let fill = cell_fill(*pos, &self.game, &win_cells, sug_rank, hovered);
+                let policy_prior = self.policy_heatmap.iter()
+                    .find(|(p, _)| p == pos)
+                    .map(|(_, v)| *v)
+                    .unwrap_or(0.0);
+                let fill = cell_fill(*pos, &self.game, &win_cells, sug_rank, hovered, policy_prior);
                 let stroke_col = if win_cells.contains(pos) {
                     Color32::YELLOW
                 } else {

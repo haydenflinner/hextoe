@@ -26,11 +26,13 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use candle_core::{Device, Tensor};
+use candle_nn::ops::log_softmax;
 use candle_nn::optim::{AdamW, ParamsAdamW};
 use candle_nn::Optimizer;
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
 
+use hextoe::encode::GRID;
 use hextoe::game::Player;
 use hextoe::nnue::{build_nnue_model, NNUENet, NNUERollout, NNUEWeights, DEFAULT_NNUE_PATH};
 use hextoe::self_play::{GameRecord, SelfPlayCollector};
@@ -54,6 +56,7 @@ fn main() {
     let buf_cap            = parse_arg(&args, "--buffer",           20_000usize);
     let save_interval      = parse_arg(&args, "--save-interval",    300u64);
     let human_frac_cfg     = parse_arg_f64(&args, "--human-frac",   -1.0); // -1 = auto
+    let policy_weight      = parse_arg_f64(&args, "--policy-weight", 1.0);
     let out_path           = parse_arg_str(&args, "--out",          DEFAULT_NNUE_PATH);
     let best_path          = parse_arg_str(&args, "--best",         DEFAULT_BEST_PATH);
 
@@ -197,6 +200,7 @@ fn main() {
             || (sp_per_batch == 0 && human_records.len() >= batch_size);
 
         let mut total_loss = 0.0f32;
+        let mut total_policy_loss = 0.0f32;
         let mut loss_steps = 0usize;
 
         if can_train {
@@ -227,27 +231,48 @@ fn main() {
                 if feats.is_empty() { continue; }
                 let b = feats.len();
 
-                let result = (|| -> candle_core::Result<f32> {
+                let result = (|| -> candle_core::Result<(f32, f32)> {
                     let input  = NNUENet::dense_from_sparse(&feats, &device)?;
                     let target = Tensor::from_slice(&z, (b, 1usize), &device)?;
-                    let output = model.forward(&input)?;
-                    let loss   = (&output - &target)?.sqr()?.mean_all()?;
+                    let (value_output, policy_logits) = model.forward_value_and_policy(&input)?;
+                    let value_loss = (&value_output - &target)?.sqr()?.mean_all()?;
+
+                    // Policy loss: cross-entropy on self-play portion only.
+                    let policy_loss_val = if sp_take > 0 {
+                        let mut pi_data = vec![0.0f32; sp_take * GRID * GRID];
+                        for (i, &si) in sp_idx[..sp_take].iter().enumerate() {
+                            pi_data[i * GRID * GRID..(i + 1) * GRID * GRID]
+                                .copy_from_slice(&*sp_usable[si].pi);
+                        }
+                        let pi_targets = Tensor::from_vec(pi_data, (sp_take, GRID * GRID), &device)?;
+                        let sp_logits = policy_logits.narrow(0, 0, sp_take)?;
+                        let log_probs = log_softmax(&sp_logits, 1)?;
+                        // Cross-entropy: -mean(sum(pi * log_p, dim=1))
+                        let ce = (pi_targets * log_probs)?.sum(1)?.mean_all()?;
+                        (ce * (-1.0f64))?
+                    } else {
+                        Tensor::zeros((), candle_core::DType::F32, &device)?
+                    };
+
+                    let scaled_policy_loss = (&policy_loss_val * policy_weight)?;
+                    let loss = (&value_loss + &scaled_policy_loss)?;
                     opt.backward_step(&loss)?;
-                    loss.to_scalar::<f32>()
+                    Ok((value_loss.to_scalar::<f32>()?, policy_loss_val.to_scalar::<f32>()?))
                 })();
                 match result {
-                    Ok(l) => { total_loss += l; loss_steps += 1; }
+                    Ok((vl, pl)) => { total_loss += vl; total_policy_loss += pl; loss_steps += 1; }
                     Err(e) => eprintln!("train step error: {e}"),
                 }
             }
         }
 
         let mean_loss = if loss_steps > 0 { total_loss / loss_steps as f32 } else { f32::NAN };
+        let mean_policy_loss = if loss_steps > 0 { total_policy_loss / loss_steps as f32 } else { f32::NAN };
         let iter_secs = t_iter.elapsed().as_secs_f64();
 
         println!(
-            "iter {:4}  buf {:5}  naive W:{naive_wins} L:{naive_losses}  self W:{self_wins} L:{self_losses}  loss {:.4}  {:.1}s",
-            iter, buffer.len(), mean_loss, iter_secs
+            "iter {:4}  buf {:5}  naive W:{naive_wins} L:{naive_losses}  self W:{self_wins} L:{self_losses}  val_loss {:.4}  pol_loss {:.4}  {:.1}s",
+            iter, buffer.len(), mean_loss, mean_policy_loss, iter_secs
         );
 
         // ── Time-based save ──────────────────────────────────────────────────
@@ -344,7 +369,7 @@ fn collect_data_paths(args: &[String]) -> Vec<String> {
     let flags_with_values = [
         "--mcts", "--games-per-iter", "--naive-frac", "--train-steps", "--batch-size",
         "--lr", "--eval-games", "--eval-every", "--promote-rate", "--promote-streak",
-        "--buffer", "--save-interval", "--human-frac", "--out", "--best",
+        "--buffer", "--save-interval", "--human-frac", "--policy-weight", "--out", "--best",
     ];
     let mut paths = Vec::new();
     let mut i = 1usize; // skip argv[0]
