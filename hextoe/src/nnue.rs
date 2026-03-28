@@ -152,37 +152,40 @@ impl NNUENet {
         self.fc3.forward(&x)?.tanh()
     }
 
-    /// Sparse forward pass — avoids the O(batch × N_FEATURES) dense matmul by
-    /// summing only the active feature columns of fc0.weight for each sample.
+    /// Sparse forward pass for training — avoids the O(batch × N_FEATURES) dense matmul.
     ///
-    /// With N_FEATURES = 22K but only ~400 active features per position, this is
-    /// ~50× faster than `forward(dense_from_sparse(...))` at the L1 step.
+    /// Pads all feature lists in the batch to the same length, does ONE batched
+    /// index_select into fc0.weight, then masks out padding and sums per sample.
+    /// Intermediate tensor is [batch × max_active × L1_SIZE] rather than
+    /// [batch × N_FEATURES × L1_SIZE], giving a ~50× speedup when N_FEATURES is large.
     pub fn forward_sparse(&self, features_batch: &[Vec<usize>], device: &Device) -> CResult<Tensor> {
         let b = features_batch.len();
-        // fc0.weight is [L1_SIZE, N_FEATURES]; transpose to [N_FEATURES, L1_SIZE]
-        // so we can index_select rows by active feature index.
-        // .contiguous() is required: index_select rejects non-contiguous views.
-        let w0_t = self.fc0.weight().t()?.contiguous()?;
-        let b0 = self.fc0.bias().expect("fc0 bias required");
+        let max_len = features_batch.iter().map(|f| f.len()).max().unwrap_or(0).max(1);
 
-        let mut l1_rows: Vec<Tensor> = Vec::with_capacity(b);
-        for feats in features_batch {
-            let row = if feats.is_empty() {
-                b0.unsqueeze(0)?
-            } else {
-                let idx = Tensor::from_vec(
-                    feats.iter().map(|&f| f as u32).collect::<Vec<_>>(),
-                    (feats.len(),),
-                    device,
-                )?;
-                // [n_active, L1_SIZE] → sum → [L1_SIZE] → add bias → [1, L1_SIZE]
-                (w0_t.index_select(&idx, 0)?.sum(0)? + b0)?.unsqueeze(0)?
-            };
-            l1_rows.push(row.clamp(0f32, 1f32)?);
+        // Build padded index [b × max_len] and float mask [b, max_len, 1].
+        // Padding entries use index 0 and are zeroed out by the mask.
+        let mut idx_data  = vec![0u32;  b * max_len];
+        let mut mask_data = vec![0.0f32; b * max_len];
+        for (i, feats) in features_batch.iter().enumerate() {
+            for (j, &f) in feats.iter().enumerate() {
+                idx_data [i * max_len + j] = f as u32;
+                mask_data[i * max_len + j] = 1.0;
+            }
         }
 
-        let l1 = Tensor::cat(&l1_rows, 0)?;   // [batch, L1_SIZE]
-        let l2 = self.fc1.forward(&l1)?.clamp(0f32, 1f32)?;
+        let idx  = Tensor::from_vec(idx_data,  (b * max_len,), device)?;
+        let mask = Tensor::from_vec(mask_data, (b, max_len, 1), device)?;
+
+        // w0_t: [N_FEATURES, L1_SIZE] — must be contiguous for index_select.
+        let w0_t = self.fc0.weight().t()?.contiguous()?;
+        let b0   = self.fc0.bias().expect("fc0 bias");
+
+        // ONE index_select: [b*max_len, L1_SIZE] → [b, max_len, L1_SIZE]
+        let rows = w0_t.index_select(&idx, 0)?.reshape((b, max_len, L1_SIZE))?;
+        // Masked sum over the feature dimension → [b, L1_SIZE]
+        let acc  = ((rows * mask)?.sum(1)? + b0.unsqueeze(0)?)?.clamp(0f32, 1f32)?;
+
+        let l2 = self.fc1.forward(&acc)?.clamp(0f32, 1f32)?;
         let l3 = self.fc2.forward(&l2)?.clamp(0f32, 1f32)?;
         self.fc3.forward(&l3)?.tanh()
     }
