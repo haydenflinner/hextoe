@@ -226,8 +226,8 @@ pub struct TrainingMonitor {
     pub mean_loss: Option<f32>,
     pub last_checkpoint_msg: Option<String>,
     pub last_promotion_msg: Option<String>,
-    /// MCTS uses [`RandomRollout`] when true, [`NeuralRollout`] when false.
     pub use_random_rollout: bool,
+    pub use_nnue_rollout: bool,
     pub self_play_parallel_games: usize,
     pub log: VecDeque<String>,
 }
@@ -255,6 +255,7 @@ impl TrainingMonitor {
             last_checkpoint_msg: None,
             last_promotion_msg: None,
             use_random_rollout: config.use_random_rollout,
+            use_nnue_rollout: config.use_nnue_rollout,
             self_play_parallel_games: parallel_game_count(config),
             log: VecDeque::with_capacity(LOG_CAP.min(32)),
         }

@@ -119,6 +119,7 @@ impl eframe::App for TrainDashboard {
                     g.train_steps,
                     g.batch_size,
                     g.use_random_rollout,
+                    g.use_nnue_rollout,
                     g.current_game,
                     g.current_move,
                     g.last_mcts_secs,
@@ -144,6 +145,7 @@ impl eframe::App for TrainDashboard {
                 train_steps,
                 batch_size,
                 use_random_rollout,
+                use_nnue_rollout,
                 cur_game,
                 cur_move,
                 last_mcts,
@@ -194,8 +196,10 @@ impl eframe::App for TrainDashboard {
                             "MCTS simulation: {}",
                             if use_random_rollout {
                                 "random rollout (fast)"
+                            } else if use_nnue_rollout {
+                                "NNUE value at leaf"
                             } else {
-                                "NN value at leaf"
+                                "CNN value at leaf"
                             }
                         ));
                         ui.separator();
