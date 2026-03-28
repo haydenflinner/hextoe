@@ -534,7 +534,8 @@ def main():
         candidate.eval()
 
         # 1. Generate games.
-        n_naive = max(1, int(args.games_per_iter * args.naive_frac))
+        #n_naive = max(1, int(args.games_per_iter * args.naive_frac))
+        n_naive = int(args.games_per_iter * args.naive_frac)
         n_self  = args.games_per_iter - n_naive
         new_samples = 0
 
