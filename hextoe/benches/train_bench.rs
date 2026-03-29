@@ -32,6 +32,8 @@ fn dummy_game_records(batch: usize) -> Vec<GameRecord> {
                 state_enc: Box::new(state_enc),
                 pi: Box::new(pi),
                 outcome: if rng.gen_bool(0.5) { 1.0 } else { -1.0 },
+                nnue_feats: vec![],
+                center: (0, 0),
             }
         })
         .collect()

@@ -10,7 +10,7 @@ as two independent turns that have to be considered separately (which really was
 
 the last day of toil seemed to only make things worse, I think this git sha was probably when it last performed pretty well
 
-○  utkttmzx haydenflinner@gmail.com 2026-03-28 08:59:59 972601f0 <-- GIT SHA
+○  utkttmzx hayden 2026-03-28 08:59:59 972601f0 <-- GIT SHA
 │  oh hell yeah
 
 
